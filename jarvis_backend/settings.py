@@ -183,3 +183,40 @@ CHANNEL_LAYERS = {
         'BACKEND': 'channels.layers.InMemoryChannelLayer',
     },
 }
+
+# Add this to your existing settings.py file
+
+# OpenAI Configuration for LangChain
+OPENAI_API_KEY = 'your-openai-api-key-here'  # Replace with actual key
+
+# LangChain Settings
+LANGCHAIN_CONFIG = {
+    'model_temperature': 0.3,
+    'max_tokens': 1000,
+    'fallback_enabled': True,
+    'verbose_logging': True
+}
+
+# Logging configuration for agents
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'file': {
+            'level': 'INFO',
+            'class': 'logging.FileHandler',
+            'filename': 'agent.log',
+        },
+        'console': {
+            'level': 'INFO',
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'loggers': {
+        'tasks_api.agents': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': True,
+        },
+    },
+}
