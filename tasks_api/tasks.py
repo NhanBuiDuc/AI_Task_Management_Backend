@@ -1,245 +1,408 @@
+# File: tasks_api/tasks.py
+
 from celery import shared_task
+from celery.utils.log import get_task_logger
+from django.core.cache import cache
+from django.db import transaction
 from django.utils import timezone
-from datetime import datetime, timedelta
-from django.db.models import Q
-from .models import Task, TaskView, Project
-from channels.layers import get_channel_layer
-from asgiref.sync import async_to_sync
+from typing import Dict, List, Optional, Any
 import json
+import traceback
+from datetime import timedelta
 
+from .models import Task, Project, Section
+from .agents.task_agent import TaskAgent
+from .serializers import TaskSerializer
+from .utils.notifications import NotificationService
+from .utils.analytics import AnalyticsTracker
 
-def calculate_and_broadcast_task_counts():
-    """Calculate task counts and broadcast to WebSocket clients."""
-    today_date = timezone.now().date()
+logger = get_task_logger(__name__)
 
-    # Calculate upcoming boundaries (matches frontend and model logic)
-    upcoming_start = today_date
-    upcoming_end = today_date + timedelta(days=14)
+class TaskProcessingError(Exception):
+    """Custom exception for task processing failures"""
+    pass
 
-    # Count tasks for each view (excluding totally completed tasks)
-    active_tasks = Task.objects.filter(totally_completed=False)
+@shared_task(bind=True, max_retries=3, soft_time_limit=60)
+def process_ai_intention(
+    self,
+    intention: str,
+    user_id: int,
+    session_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Process natural language intention asynchronously using AI agent.
+    
+    Args:
+        intention: Natural language input from user
+        user_id: ID of the user
+        session_id: Optional session ID for tracking
+        metadata: Additional context data
+        
+    Returns:
+        Dict containing created tasks and processing insights
+    """
+    try:
+        # Check cache for duplicate requests
+        cache_key = f"ai_intention:{user_id}:{hash(intention)}"
+        cached_result = cache.get(cache_key)
+        if cached_result:
+            logger.info(f"Returning cached result for user {user_id}")
+            return cached_result
+        
+        # Initialize AI agent
+        agent = TaskAgent()
+        
+        # Add user context to agent
+        user_context = _get_user_context(user_id)
+        
+        # Process intention with retry logic
+        try:
+            processed_data = agent.process_intention(
+                intention=intention,
+                user_context=user_context
+            )
+        except Exception as e:
+            logger.warning(f"AI processing failed, using fallback: {str(e)}")
+            processed_data = _fallback_processing(intention, user_id)
+        
+        # Create tasks in database
+        created_tasks = []
+        with transaction.atomic():
+            for task_data in processed_data.get('tasks', []):
+                task = _create_task_from_ai_data(task_data, user_id)
+                created_tasks.append(task)
+                
+                # Schedule recurring tasks if needed
+                if task_data.get('recurring'):
+                    schedule_recurring_task.delay(
+                        task_id=task.id,
+                        pattern=task_data['recurring']
+                    )
+        
+        # Store insights asynchronously
+        if processed_data.get('insights'):
+            store_ai_insights.delay(
+                user_id=user_id,
+                insights=processed_data['insights'],
+                session_id=session_id
+            )
+        
+        # Prepare response
+        result = {
+            'status': 'success',
+            'tasks': TaskSerializer(created_tasks, many=True).data,
+            'insights': processed_data.get('insights', {}),
+            'processing_time': processed_data.get('processing_time', 0),
+            'ai_confidence': processed_data.get('confidence', 0.0)
+        }
+        
+        # Cache result for 5 minutes
+        cache.set(cache_key, result, 300)
+        
+        # Track analytics
+        AnalyticsTracker.track_ai_processing(
+            user_id=user_id,
+            task_count=len(created_tasks),
+            processing_time=result['processing_time']
+        )
+        
+        # Send real-time notification
+        NotificationService.notify_tasks_created(
+            user_id=user_id,
+            tasks=created_tasks,
+            session_id=session_id
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Task processing failed: {str(e)}\n{traceback.format_exc()}")
+        
+        # Retry with exponential backoff
+        retry_count = self.request.retries
+        if retry_count < self.max_retries:
+            raise self.retry(countdown=2 ** retry_count)
+        
+        # Final failure - notify user
+        NotificationService.notify_processing_failure(
+            user_id=user_id,
+            error_message=str(e),
+            session_id=session_id
+        )
+        
+        raise TaskProcessingError(f"Failed to process intention: {str(e)}")
 
-    # Inbox: tasks with inbox view BUT NOT project view (non-project tasks only)
-    inbox_task_ids = TaskView.objects.filter(view='inbox').values_list('task_id', flat=True)
-    project_task_ids = TaskView.objects.filter(view='project').values_list('task_id', flat=True)
-    inbox_count = active_tasks.filter(
-        id__in=inbox_task_ids
-    ).exclude(
-        id__in=project_task_ids
-    ).count()
+@shared_task
+def schedule_recurring_task(task_id: int, pattern: Dict[str, Any]) -> None:
+    """
+    Schedule recurring task instances based on pattern.
+    
+    Args:
+        task_id: ID of the parent task
+        pattern: Recurrence pattern (daily, weekly, custom)
+    """
+    try:
+        task = Task.objects.get(id=task_id)
+        
+        # Parse recurrence pattern
+        frequency = pattern.get('frequency', 'daily')
+        count = pattern.get('count', 30)  # Default 30 occurrences
+        
+        # Generate future instances
+        current_date = timezone.now().date()
+        for i in range(1, count + 1):
+            if frequency == 'daily':
+                next_date = current_date + timedelta(days=i)
+            elif frequency == 'weekly':
+                next_date = current_date + timedelta(weeks=i)
+            elif frequency == 'custom':
+                # Handle custom patterns (e.g., every 3 days)
+                interval = pattern.get('interval', 1)
+                next_date = current_date + timedelta(days=i * interval)
+            
+            # Create scheduled instance
+            Task.objects.create(
+                user_id=task.user_id,
+                project_id=task.project_id,
+                section_id=task.section_id,
+                title=task.title,
+                description=task.description,
+                due_date=next_date,
+                priority=task.priority,
+                parent_task_id=task.id,
+                is_recurring_instance=True
+            )
+        
+        logger.info(f"Scheduled {count} recurring instances for task {task_id}")
+        
+    except Task.DoesNotExist:
+        logger.error(f"Task {task_id} not found for recurring schedule")
+    except Exception as e:
+        logger.error(f"Failed to schedule recurring task: {str(e)}")
 
-    # Today: tasks due today (matching Today page logic)
-    today_count = active_tasks.filter(due_date=today_date).count()
+@shared_task
+def store_ai_insights(
+    user_id: int,
+    insights: Dict[str, Any],
+    session_id: Optional[str] = None
+) -> None:
+    """
+    Store AI-generated insights in MongoDB for analytics.
+    
+    Args:
+        user_id: User identifier
+        insights: AI-generated insights and recommendations
+        session_id: Optional session tracking
+    """
+    try:
+        from .utils.mongodb import get_insights_collection
+        
+        collection = get_insights_collection()
+        
+        # Prepare document
+        document = {
+            'user_id': user_id,
+            'insights': insights,
+            'session_id': session_id,
+            'created_at': timezone.now().isoformat(),
+            'type': 'task_processing',
+            'confidence_scores': insights.get('confidence_scores', {}),
+            'recommendations': insights.get('recommendations', [])
+        }
+        
+        # Store in MongoDB
+        collection.insert_one(document)
+        
+        # Update user's productivity score
+        update_productivity_score.delay(user_id=user_id)
+        
+    except Exception as e:
+        logger.error(f"Failed to store insights: {str(e)}")
 
-    # Upcoming: tasks due between current day and current day + 14
-    upcoming_count = active_tasks.filter(
-        due_date__gte=upcoming_start,
-        due_date__lte=upcoming_end
-    ).count()
+@shared_task
+def update_productivity_score(user_id: int) -> float:
+    """
+    Calculate and update user's productivity score based on task completion.
+    
+    Args:
+        user_id: User identifier
+        
+    Returns:
+        Updated productivity score
+    """
+    try:
+        # Get user's task statistics
+        from django.db.models import Count, Q, Avg
+        from datetime import datetime, timedelta
+        
+        thirty_days_ago = timezone.now() - timedelta(days=30)
+        
+        stats = Task.objects.filter(
+            user_id=user_id,
+            created_at__gte=thirty_days_ago
+        ).aggregate(
+            total=Count('id'),
+            completed=Count('id', filter=Q(is_completed=True)),
+            overdue=Count('id', filter=Q(
+                due_date__lt=timezone.now(),
+                is_completed=False
+            )),
+            avg_completion_time=Avg('completion_time')
+        )
+        
+        # Calculate score (0-100)
+        completion_rate = stats['completed'] / stats['total'] if stats['total'] > 0 else 0
+        overdue_penalty = stats['overdue'] / stats['total'] if stats['total'] > 0 else 0
+        
+        score = (completion_rate * 70) + ((1 - overdue_penalty) * 30)
+        
+        # Store score
+        cache.set(f"productivity_score:{user_id}", score, 3600)
+        
+        # Trigger achievement check
+        check_user_achievements.delay(user_id=user_id, score=score)
+        
+        return score
+        
+    except Exception as e:
+        logger.error(f"Failed to update productivity score: {str(e)}")
+        return 0.0
 
-    # Overdue: tasks due before today
-    overdue_count = active_tasks.filter(due_date__lt=today_date).count()
+@shared_task
+def check_user_achievements(user_id: int, score: float) -> None:
+    """
+    Check and award user achievements based on activity.
+    
+    Args:
+        user_id: User identifier
+        score: Current productivity score
+    """
+    try:
+        from .models import UserAchievement
+        
+        achievements_earned = []
+        
+        # Define achievement criteria
+        achievements = [
+            {'id': 'first_task', 'name': 'First Step', 'criteria': lambda: Task.objects.filter(user_id=user_id).count() >= 1},
+            {'id': 'productive_week', 'name': 'Productive Week', 'criteria': lambda: score >= 80},
+            {'id': 'task_master', 'name': 'Task Master', 'criteria': lambda: Task.objects.filter(user_id=user_id, is_completed=True).count() >= 100},
+        ]
+        
+        for achievement in achievements:
+            if achievement['criteria']():
+                obj, created = UserAchievement.objects.get_or_create(
+                    user_id=user_id,
+                    achievement_id=achievement['id'],
+                    defaults={'name': achievement['name']}
+                )
+                if created:
+                    achievements_earned.append(achievement['name'])
+        
+        # Notify user of new achievements
+        if achievements_earned:
+            NotificationService.notify_achievements(
+                user_id=user_id,
+                achievements=achievements_earned
+            )
+            
+    except Exception as e:
+        logger.error(f"Failed to check achievements: {str(e)}")
 
-    # Completed: totally completed tasks
-    completed_count = Task.objects.filter(totally_completed=True).count()
+def _get_user_context(user_id: int) -> Dict[str, Any]:
+    """Get user's context for AI processing"""
+    try:
+        # Get user's recent tasks and patterns
+        recent_tasks = Task.objects.filter(
+            user_id=user_id
+        ).order_by('-created_at')[:20]
+        
+        # Get user's projects
+        projects = Project.objects.filter(user_id=user_id)
+        
+        return {
+            'recent_task_titles': [t.title for t in recent_tasks],
+            'project_names': [p.name for p in projects],
+            'preferred_categories': _get_preferred_categories(user_id),
+            'typical_priority': _get_typical_priority(user_id),
+            'timezone': _get_user_timezone(user_id)
+        }
+    except Exception as e:
+        logger.error(f"Failed to get user context: {str(e)}")
+        return {}
 
-    # Projects: get count for each project (excluding totally completed)
-    projects = Project.objects.all()
-    project_counts = {}
-    for project in projects:
-        project_counts[str(project.id)] = active_tasks.filter(project_id=project.id).count()
-
-    counts = {
-        'inbox': inbox_count,
-        'today': today_count,
-        'upcoming': upcoming_count,
-        'overdue': overdue_count,
-        'completed': completed_count,
-        'projects': project_counts
+def _fallback_processing(intention: str, user_id: int) -> Dict[str, Any]:
+    """Fallback processing when AI fails"""
+    # Simple keyword-based extraction
+    keywords = {
+        'daily': {'recurring': {'frequency': 'daily'}},
+        'weekly': {'recurring': {'frequency': 'weekly'}},
+        'urgent': {'priority': 4},
+        'important': {'priority': 3}
+    }
+    
+    task_data = {
+        'title': intention[:100],  # Truncate to title length
+        'description': intention,
+        'priority': 2,  # Default medium priority
+        'category': 'personal'
+    }
+    
+    # Check for keywords
+    intention_lower = intention.lower()
+    for keyword, attributes in keywords.items():
+        if keyword in intention_lower:
+            task_data.update(attributes)
+    
+    return {
+        'tasks': [task_data],
+        'insights': {'fallback_used': True},
+        'confidence': 0.3
     }
 
-    # Broadcast to WebSocket clients
-    channel_layer = get_channel_layer()
-    async_to_sync(channel_layer.group_send)(
-        'task_count_updates',
-        {
-            'type': 'task_count_update',
-            'data': counts
-        }
+def _create_task_from_ai_data(task_data: Dict[str, Any], user_id: int) -> Task:
+    """Create task instance from AI-processed data"""
+    # Get or create project
+    project_name = task_data.get('project', 'Inbox')
+    project, _ = Project.objects.get_or_create(
+        user_id=user_id,
+        name=project_name,
+        defaults={'color': '#808080'}
+    )
+    
+    # Get or create section
+    section = None
+    if task_data.get('section'):
+        section, _ = Section.objects.get_or_create(
+            project=project,
+            name=task_data['section']
+        )
+    
+    # Create task
+    return Task.objects.create(
+        user_id=user_id,
+        project=project,
+        section=section,
+        title=task_data['title'],
+        description=task_data.get('description', ''),
+        priority=task_data.get('priority', 2),
+        due_date=task_data.get('due_date'),
+        labels=task_data.get('labels', []),
+        estimated_duration=task_data.get('duration'),
+        ai_generated=True,
+        ai_confidence=task_data.get('confidence', 1.0)
     )
 
-    return counts
+def _get_preferred_categories(user_id: int) -> List[str]:
+    """Get user's most used categories"""
+    # Implementation depends on your category tracking
+    return ['work', 'personal', 'health']
 
-@shared_task
-def categorize_tasks_by_due_date():
-    """
-    Periodic task that automatically categorizes tasks based on their due dates.
-    This runs every 10 seconds for real-time updates of task views based on due date.
+def _get_typical_priority(user_id: int) -> int:
+    """Get user's typical priority level"""
+    return 2  # Default medium
 
-    Example: If today is 22/Sep/2025 2:00 PM and a task due date is 23/Sep/2025 2:00 PM,
-    the task should be in ["today", "upcoming"] or ["project", "today", "upcoming"] if it belongs to a project.
-    """
-    now = timezone.now()
-    today_date = now.date()
-
-    # Calculate upcoming range: current day to current day + 14 (matches frontend logic)
-    upcoming_start = today_date
-    upcoming_end = today_date + timedelta(days=14)
-
-    # Get all active tasks (not totally completed)
-    active_tasks = Task.objects.filter(totally_completed=False)
-
-    categorized_count = 0
-
-    for task in active_tasks:
-        if not task.due_date:
-            continue
-
-        task_due_date = task.due_date
-        new_views = []
-
-        # Determine base view (inbox or project)
-        if task.project_id:
-            new_views.append("project")
-        else:
-            new_views.append("inbox")
-
-        # Add time-based views based on due date
-        if task_due_date < today_date:
-            new_views.append("overdue")
-        elif task_due_date == today_date:
-            new_views.append("today")
-        elif upcoming_start <= task_due_date <= upcoming_end:
-            new_views.append("upcoming")
-
-        # Update task views if they've changed
-        current_views = list(task.task_views.values_list('view', flat=True))
-
-        if set(new_views) != set(current_views):
-            # Clear existing views
-            task.task_views.all().delete()
-
-            # Add new views
-            for view in new_views:
-                TaskView.objects.create(task=task, view=view)
-
-            categorized_count += 1
-
-    # Broadcast updated counts to WebSocket clients if any tasks were updated
-    if categorized_count > 0:
-        counts = calculate_and_broadcast_task_counts()
-        return f"Successfully categorized {categorized_count} tasks and broadcast counts: {counts}"
-    else:
-        return f"No tasks needed categorization update"
-
-@shared_task
-def update_task_current_view():
-    """
-    Alternative implementation that directly updates the current_view field if it exists.
-    This is a backup approach in case we decide to use a direct field instead of TaskView model.
-    """
-    now = timezone.now()
-    today_date = now.date()
-
-    # Calculate upcoming range: current day to current day + 14 (matches frontend logic)
-    upcoming_start = today_date
-    upcoming_end = today_date + timedelta(days=14)
-
-    # Get all active tasks
-    active_tasks = Task.objects.filter(totally_completed=False)
-
-    updated_count = 0
-
-    for task in active_tasks:
-        if not task.due_date:
-            continue
-
-        task_due_date = task.due_date
-        new_views = []
-
-        # Base view
-        if task.project_id:
-            new_views.append("project")
-        else:
-            new_views.append("inbox")
-
-        # Time-based views
-        if task_due_date < today_date:
-            new_views.append("overdue")
-        elif task_due_date == today_date:
-            new_views.append("today")
-        elif upcoming_start <= task_due_date <= upcoming_end:
-            new_views.append("upcoming")
-
-        # Update if there's a current_view field in the Task model
-        # Note: This would require adding a current_view field to the Task model
-        # For now, we'll use the TaskView approach above
-
-        updated_count += 1
-
-    return f"Processed {updated_count} tasks for view updates"
-
-@shared_task
-def daily_section_maintenance():
-    """
-    Daily task to ensure Today sections exist and clean up old sections.
-    This runs once per day to maintain the Today view sections.
-    """
-    from .models import Section
-
-    now = timezone.now()
-    today_date = now.date()
-
-    # Create today's section if it doesn't exist
-    today_section_name = today_date.strftime("%d %B %Y")
-
-    section, created = Section.objects.get_or_create(
-        name=today_section_name,
-        project_id=None,
-        defaults={'name': today_section_name}
-    )
-
-    # Add today view to the section if needed
-    if created:
-        from .models import SectionView
-        SectionView.objects.get_or_create(section=section, view="today")
-
-    result = f"Today section '{today_section_name}' "
-    result += "created" if created else "already exists"
-
-    return result
-
-@shared_task
-def check_and_update_overdue_tasks():
-    """
-    Specifically focused task to check for tasks that have become overdue.
-    This runs more frequently to ensure timely updates of overdue status.
-    """
-    now = timezone.now()
-    today_date = now.date()
-
-    # Find all tasks that are due before today but not marked as overdue yet
-    tasks_to_update = Task.objects.filter(
-        totally_completed=False,
-        due_date__lt=today_date
-    ).exclude(
-        task_views__view='overdue'
-    )
-
-    updated_count = 0
-
-    for task in tasks_to_update:
-        # Add overdue view if not already present
-        if not task.task_views.filter(view='overdue').exists():
-            TaskView.objects.create(task=task, view='overdue')
-            updated_count += 1
-
-        # Remove today and upcoming views if present (since task is now overdue)
-        task.task_views.filter(view__in=['today', 'upcoming']).delete()
-
-    # Broadcast updated counts to WebSocket clients if any tasks were updated
-    if updated_count > 0:
-        counts = calculate_and_broadcast_task_counts()
-        return f"Successfully marked {updated_count} tasks as overdue and broadcast counts: {counts}"
-    else:
-        return "No new overdue tasks found"
+def _get_user_timezone(user_id: int) -> str:
+    """Get user's timezone"""
+    return 'UTC'  # Default, should get from user profile
