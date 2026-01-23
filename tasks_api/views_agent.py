@@ -3,7 +3,7 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.core.cache import cache
 from django.utils import timezone
 from typing import Dict, Any, List, Optional
@@ -11,13 +11,599 @@ import json
 import uuid
 from datetime import datetime, timedelta
 
-from .models import Task, Project, Section
+from .models import Task, Project, Section, Account
 from .serializers import TaskSerializer
-from .agents.task_agent import TaskAgent
+from .agents.task_agent import (
+    TaskAgent, AgentResponse, ResponseType, ActionType,
+    TaskAction, TaskSuggestion
+)
+from .agents.intent_agent import IntentAgent
+from .agents.intent_handlers import IntentHandlers
+from .agents.intent_registry import get_intent_by_id, ActionType as IntentActionType
 from .tasks import process_ai_intention, analyze_user_patterns
-from .utils.analytics import AnalyticsTracker
+from .utils.analytics import AnalyticsTracker, AnalyticsEvent
 from .utils.mongodb import InsightsRepository, TaskPatternsRepository
 from .utils.notifications import NotificationService, Notification, NotificationType
+
+
+def get_account_from_request(request):
+    """Get account from X-Account-ID header."""
+    account_id = request.headers.get('X-Account-ID')
+    if not account_id:
+        return None
+    try:
+        return Account.objects.get(id=account_id, is_active=True)
+    except (Account.DoesNotExist, ValueError):
+        return None
+
+
+# =============================================================================
+# NEW: Conversation-based Chat API
+# =============================================================================
+
+class AIChatView(APIView):
+    """
+    Conversation-based AI chat for task management.
+
+    Supports:
+    - Multi-turn conversations with context
+    - CRUD operations via natural language (read, insert, update, delete, complete)
+    - Task suggestions with approval workflow
+    - Clarification requests for ambiguous input
+    """
+    permission_classes = [AllowAny]  # Uses X-Account-ID header
+
+    # Singleton agent instance
+    _agent = None
+
+    @classmethod
+    def get_agent(cls):
+        """Get or create TaskAgent singleton."""
+        if cls._agent is None:
+            cls._agent = TaskAgent()
+        return cls._agent
+
+    def post(self, request):
+        """
+        POST /api/ai/chat/
+        Send a message to the AI assistant.
+
+        Body:
+        {
+            "message": "User's natural language input",
+            "session_id": "optional-session-id-for-context"
+        }
+
+        Returns:
+        {
+            "type": "actions|clarify|suggest|chat",
+            "message": "User-friendly response",
+            "actions": [...],       // Database actions to execute
+            "suggestions": [...],   // Tasks waiting for approval
+            "clarify_options": [...], // Options for clarification
+            "session_id": "session-id"
+        }
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        message = request.data.get('message', '').strip()
+        session_id = request.data.get('session_id')
+
+        if not message:
+            return Response(
+                {'error': 'Message cannot be empty'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            # Get user's tasks for context
+            user_tasks = list(Task.objects.filter(
+                user=account,
+                totally_completed=False
+            ).values('id', 'name', 'due_date', 'completed')[:20])
+
+            # Process through agent
+            agent = self.get_agent()
+            response = agent.chat(
+                user_input=message,
+                session_id=session_id,
+                user_tasks=user_tasks
+            )
+
+            # Execute actions if any
+            action_results = []
+            if response.type == ResponseType.ACTIONS and response.actions:
+                action_results = self._execute_actions(account, response.actions)
+                # Update message with results
+                response.message = self._build_result_message(response.actions, action_results)
+
+            # Track analytics
+            try:
+                AnalyticsTracker.track_event(AnalyticsEvent(
+                    event_type='ai_chat_message',
+                    user_id=account.id,
+                    data={
+                        'message_length': len(message),
+                        'response_type': response.type.value,
+                        'actions_count': len(response.actions),
+                        'suggestions_count': len(response.suggestions)
+                    }
+                ))
+            except Exception:
+                pass  # Analytics failure shouldn't break the API
+
+            return Response({
+                'type': response.type.value,
+                'message': response.message,
+                'actions': [self._action_to_dict(a) for a in response.actions],
+                'action_results': action_results,
+                'suggestions': [self._suggestion_to_dict(s) for s in response.suggestions],
+                'clarify_options': response.clarify_options,
+                'session_id': response.context_key
+            })
+
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to process message: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def _execute_actions(
+        self,
+        account: Account,
+        actions: List[TaskAction]
+    ) -> List[Dict]:
+        """Execute database actions and return results."""
+        results = []
+
+        for action in actions:
+            try:
+                if action.action == ActionType.READ:
+                    result = self._execute_read(account, action)
+                elif action.action == ActionType.INSERT:
+                    result = self._execute_insert(account, action)
+                elif action.action == ActionType.UPDATE:
+                    result = self._execute_update(account, action)
+                elif action.action == ActionType.DELETE:
+                    result = self._execute_delete(account, action)
+                elif action.action == ActionType.COMPLETE:
+                    result = self._execute_complete(account, action)
+                else:
+                    result = {'status': 'unknown_action'}
+
+                results.append({
+                    'action': action.action.value,
+                    'success': True,
+                    **result
+                })
+
+            except Exception as e:
+                results.append({
+                    'action': action.action.value,
+                    'success': False,
+                    'error': str(e)
+                })
+
+        return results
+
+    def _execute_read(self, account: Account, action: TaskAction) -> Dict:
+        """Execute read query."""
+        tasks = Task.objects.filter(user=account, totally_completed=False)
+
+        if action.query_filter == 'today':
+            today = timezone.now().date()
+            tasks = tasks.filter(due_date__date=today)
+        elif action.query_filter == 'overdue':
+            tasks = tasks.filter(due_date__lt=timezone.now(), completed=False)
+        elif action.query_filter and action.query_filter not in ['all', 'today', 'overdue']:
+            # Search by task name
+            tasks = tasks.filter(name__icontains=action.query_filter)
+
+        if action.query_type == 'count':
+            return {'count': tasks.count()}
+        elif action.query_type == 'due_date':
+            task = tasks.first()
+            if task:
+                return {
+                    'task_name': task.name,
+                    'due_date': task.due_date.isoformat() if task.due_date else None
+                }
+            return {'task_name': None, 'due_date': None}
+        else:  # list
+            return {
+                'tasks': list(tasks.values('id', 'name', 'due_date', 'completed')[:10]),
+                'count': tasks.count()
+            }
+
+    def _execute_insert(self, account: Account, action: TaskAction) -> Dict:
+        """Execute insert action."""
+        task_data = {
+            'user': account,
+            'name': action.title or 'New Task',
+            'description': action.description or '',
+            'priority': self._map_priority(action.priority),
+        }
+
+        if action.due_date:
+            try:
+                task_data['due_date'] = datetime.strptime(action.due_date, '%Y-%m-%d')
+            except ValueError:
+                pass
+
+        if action.duration:
+            task_data['duration_in_minutes'] = action.duration
+
+        task = Task.objects.create(**task_data)
+        task.update_task_views()
+
+        return {
+            'task_id': str(task.id),
+            'task_name': task.name
+        }
+
+    def _execute_update(self, account: Account, action: TaskAction) -> Dict:
+        """Execute update action."""
+        # Find task by ID or title
+        if action.task_id:
+            task = Task.objects.filter(id=action.task_id, user=account).first()
+        elif action.title:
+            task = Task.objects.filter(
+                name__icontains=action.title,
+                user=account,
+                totally_completed=False
+            ).first()
+        else:
+            return {'error': 'No task identifier provided'}
+
+        if not task:
+            return {'error': 'Task not found'}
+
+        # Update fields
+        updated_fields = []
+        if action.title and action.task_id:  # Only update title if task found by ID
+            task.name = action.title
+            updated_fields.append('name')
+
+        if action.due_date:
+            try:
+                task.due_date = datetime.strptime(action.due_date, '%Y-%m-%d')
+                updated_fields.append('due_date')
+            except ValueError:
+                pass
+
+        if action.priority is not None:
+            task.priority = self._map_priority(action.priority)
+            updated_fields.append('priority')
+
+        if action.description is not None:
+            task.description = action.description
+            updated_fields.append('description')
+
+        task.save()
+        task.update_task_views()
+
+        return {
+            'task_id': str(task.id),
+            'task_name': task.name,
+            'updated_fields': updated_fields
+        }
+
+    def _execute_delete(self, account: Account, action: TaskAction) -> Dict:
+        """Execute delete action."""
+        if action.task_id:
+            task = Task.objects.filter(id=action.task_id, user=account).first()
+        elif action.title:
+            task = Task.objects.filter(
+                name__icontains=action.title,
+                user=account,
+                totally_completed=False
+            ).first()
+        else:
+            return {'error': 'No task identifier provided'}
+
+        if not task:
+            return {'error': 'Task not found'}
+
+        task_name = task.name
+        task.delete()
+
+        return {
+            'deleted_task': task_name
+        }
+
+    def _execute_complete(self, account: Account, action: TaskAction) -> Dict:
+        """Execute complete action."""
+        if action.task_id:
+            task = Task.objects.filter(id=action.task_id, user=account).first()
+        elif action.title:
+            task = Task.objects.filter(
+                name__icontains=action.title,
+                user=account,
+                totally_completed=False
+            ).first()
+        else:
+            return {'error': 'No task identifier provided'}
+
+        if not task:
+            return {'error': 'Task not found'}
+
+        task.completed = True
+        task.completed_date = timezone.now()
+        task.save()
+
+        return {
+            'task_id': str(task.id),
+            'task_name': task.name,
+            'completed': True
+        }
+
+    def _map_priority(self, priority: Optional[int]) -> str:
+        """Map numeric priority to string."""
+        if priority is None:
+            return 'medium'
+        mapping = {1: 'low', 2: 'low', 3: 'medium', 4: 'high', 5: 'urgent'}
+        return mapping.get(priority, 'medium')
+
+    def _build_result_message(
+        self,
+        actions: List[TaskAction],
+        results: List[Dict]
+    ) -> str:
+        """Build user-friendly message from action results."""
+        parts = []
+
+        for action, result in zip(actions, results):
+            if not result.get('success'):
+                parts.append(f"Failed: {result.get('error', 'Unknown error')}")
+                continue
+
+            if action.action == ActionType.READ:
+                if 'count' in result:
+                    parts.append(f"You have {result['count']} tasks")
+                elif result.get('due_date'):
+                    parts.append(f"{result.get('task_name')} is due {result['due_date']}")
+            elif action.action == ActionType.INSERT:
+                parts.append(f"Added '{result.get('task_name')}'")
+            elif action.action == ActionType.UPDATE:
+                parts.append(f"Updated '{result.get('task_name')}'")
+            elif action.action == ActionType.DELETE:
+                parts.append(f"Deleted '{result.get('deleted_task')}'")
+            elif action.action == ActionType.COMPLETE:
+                parts.append(f"Marked '{result.get('task_name')}' as done")
+
+        return '. '.join(parts) if parts else 'Done.'
+
+    def _action_to_dict(self, action: TaskAction) -> Dict:
+        """Convert TaskAction to dict."""
+        return {
+            'action': action.action.value,
+            'task_id': action.task_id,
+            'title': action.title,
+            'description': action.description,
+            'category': action.category,
+            'priority': action.priority,
+            'due_date': action.due_date,
+            'due_time': action.due_time,
+            'duration': action.duration,
+            'frequency': action.frequency,
+            'query_type': action.query_type,
+            'query_filter': action.query_filter
+        }
+
+    def _suggestion_to_dict(self, suggestion: TaskSuggestion) -> Dict:
+        """Convert TaskSuggestion to dict."""
+        return {
+            'id': suggestion.id,
+            'title': suggestion.title,
+            'description': suggestion.description,
+            'category': suggestion.category,
+            'priority': suggestion.priority,
+            'due_date': suggestion.due_date,
+            'duration': suggestion.duration,
+            'frequency': suggestion.frequency,
+            'reason': suggestion.reason
+        }
+
+
+class AISuggestionsManageView(APIView):
+    """
+    Manage pending task suggestions from AI conversations.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, session_id):
+        """
+        GET /api/ai/suggestions/<session_id>/
+        Get pending suggestions for a session.
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        agent = AIChatView.get_agent()
+        suggestions = agent.get_pending_suggestions(session_id)
+
+        return Response({
+            'suggestions': [
+                {
+                    'id': s.id,
+                    'title': s.title,
+                    'description': s.description,
+                    'category': s.category,
+                    'priority': s.priority,
+                    'due_date': s.due_date,
+                    'duration': s.duration,
+                    'frequency': s.frequency,
+                    'reason': s.reason
+                }
+                for s in suggestions
+            ],
+            'count': len(suggestions)
+        })
+
+    def post(self, request, session_id):
+        """
+        POST /api/ai/suggestions/<session_id>/
+        Accept, modify, or reject suggestions.
+
+        Body:
+        {
+            "action": "accept_all" | "reject_all" | "accept" | "modify",
+            "suggestion_id": "id" (for accept/modify),
+            "modifications": {...} (for modify)
+        }
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        action = request.data.get('action')
+        suggestion_id = request.data.get('suggestion_id')
+        modifications = request.data.get('modifications', {})
+
+        agent = AIChatView.get_agent()
+
+        if action == 'accept_all':
+            suggestions = agent.get_pending_suggestions(session_id)
+            created_tasks = []
+
+            for sug in suggestions:
+                task = Task.objects.create(
+                    user=account,
+                    name=sug.title,
+                    description=sug.description or '',
+                    priority=self._map_priority(sug.priority)
+                )
+                task.update_task_views()
+                created_tasks.append(task)
+
+            agent.clear_suggestions(session_id)
+
+            return Response({
+                'message': f'Created {len(created_tasks)} tasks',
+                'tasks': TaskSerializer(created_tasks, many=True).data
+            }, status=status.HTTP_201_CREATED)
+
+        elif action == 'reject_all':
+            agent.clear_suggestions(session_id)
+            return Response({'message': 'All suggestions rejected'})
+
+        elif action == 'accept' and suggestion_id:
+            task_action = agent.accept_suggestion(session_id, suggestion_id)
+            if not task_action:
+                return Response(
+                    {'error': 'Suggestion not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            # Create the task
+            task = Task.objects.create(
+                user=account,
+                name=task_action.title or 'Task',
+                description=task_action.description or '',
+                priority=self._map_priority(task_action.priority)
+            )
+            task.update_task_views()
+
+            return Response({
+                'message': f'Created task: {task.name}',
+                'task': TaskSerializer(task).data
+            }, status=status.HTTP_201_CREATED)
+
+        elif action == 'modify' and suggestion_id:
+            modified = agent.modify_suggestion(session_id, suggestion_id, modifications)
+            if not modified:
+                return Response(
+                    {'error': 'Suggestion not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            return Response({
+                'message': 'Suggestion modified',
+                'suggestion': {
+                    'id': modified.id,
+                    'title': modified.title,
+                    'description': modified.description,
+                    'category': modified.category,
+                    'priority': modified.priority,
+                    'due_date': modified.due_date,
+                    'duration': modified.duration
+                }
+            })
+
+        return Response(
+            {'error': 'Invalid action'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    def _map_priority(self, priority: Optional[int]) -> str:
+        """Map numeric priority to string."""
+        if priority is None:
+            return 'medium'
+        mapping = {1: 'low', 2: 'low', 3: 'medium', 4: 'high', 5: 'urgent'}
+        return mapping.get(priority, 'medium')
+
+
+class AIChatHistoryView(APIView):
+    """
+    Get conversation history for a session.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, session_id):
+        """
+        GET /api/ai/chat/<session_id>/history/
+        Get conversation history.
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        agent = AIChatView.get_agent()
+        messages = agent.get_session_history(session_id)
+
+        return Response({
+            'messages': [
+                {
+                    'role': m.role,
+                    'content': m.content,
+                    'timestamp': m.timestamp.isoformat()
+                }
+                for m in messages
+            ],
+            'count': len(messages)
+        })
+
+    def delete(self, request, session_id):
+        """
+        DELETE /api/ai/chat/<session_id>/history/
+        Clear conversation history.
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        agent = AIChatView.get_agent()
+        agent.clear_session(session_id)
+
+        return Response({'message': 'Session cleared'})
 
 class AIIntentionView(APIView):
     """
@@ -281,15 +867,18 @@ class AISuggestionsView(APIView):
             )
             
             # Track analytics
-            AnalyticsTracker.track_event(
-                event_type='ai_suggestions_generated',
-                user_id=user_id,
-                data={
-                    'intention_length': len(intention),
-                    'suggestions_count': len(enhanced_suggestions),
-                    'context_type': context_type
-                }
-            )
+            try:
+                AnalyticsTracker.track_event(AnalyticsEvent(
+                    event_type='ai_suggestions_generated',
+                    user_id=user_id,
+                    data={
+                        'intention_length': len(intention),
+                        'suggestions_count': len(enhanced_suggestions),
+                        'context_type': context_type
+                    }
+                ))
+            except Exception:
+                pass
             
             return Response({
                 'suggestions': grouped_suggestions,
@@ -550,15 +1139,18 @@ class AIBatchProcessView(APIView):
             )
             
             # Track analytics
-            AnalyticsTracker.track_event(
-                event_type='batch_tasks_created',
-                user_id=user_id,
-                data={
-                    'count': len(created_tasks),
-                    'source': 'ai_suggestions',
-                    'project_id': project_id
-                }
-            )
+            try:
+                AnalyticsTracker.track_event(AnalyticsEvent(
+                    event_type='batch_tasks_created',
+                    user_id=user_id,
+                    data={
+                        'count': len(created_tasks),
+                        'source': 'ai_suggestions',
+                        'project_id': project_id
+                    }
+                ))
+            except Exception:
+                pass
             
             return Response({
                 'tasks': TaskSerializer(created_tasks, many=True).data,
@@ -878,5 +1470,679 @@ class AIStreamingView(APIView):
         except Exception as e:
             return Response(
                 {'error': f'Failed to initiate streaming: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+# =============================================================================
+# NEW: Intent-Based Chat API (More Efficient)
+# =============================================================================
+
+class AIIntentChatView(APIView):
+    """
+    Intent-based AI chat for task management.
+
+    Extracts ALL tasks from user input and executes them.
+
+    Features:
+    - Multi-task extraction: "I want to learn coding, go to gym, and call mom" = 3 tasks
+    - Intent-based: create, query, complete, update, delete, chat
+    - Auto-execution: Creates tasks immediately
+    - Token tracking: Reports token usage
+    """
+    permission_classes = [AllowAny]  # Uses X-Account-ID header
+
+    _agent = None
+
+    @classmethod
+    def get_agent(cls):
+        """Get or create IntentAgent singleton."""
+        if cls._agent is None:
+            cls._agent = IntentAgent()
+        return cls._agent
+
+    def post(self, request):
+        """
+        POST /ai/intent/
+        Extract tasks from natural language and execute.
+
+        Body:
+        {
+            "message": "I want to learn coding, go to gym, and call mom",
+            "session_id": "optional-session-id"
+        }
+
+        Returns:
+        {
+            "success": true,
+            "intent": "create",
+            "message": "Created 3 tasks",
+            "tasks": [
+                {"title": "learn coding", "due_date": null, "priority": "medium"},
+                {"title": "go to gym", "due_date": null, "priority": "medium"},
+                {"title": "call mom", "due_date": null, "priority": "medium"}
+            ],
+            "execution": {
+                "success": true,
+                "created_tasks": [...]
+            },
+            "session_id": "session-id",
+            "token_report": {...}
+        }
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        message = request.data.get('message', '').strip()
+        session_id = request.data.get('session_id')
+        auto_execute = request.data.get('auto_execute', True)
+
+        if not message:
+            return Response(
+                {'error': 'Message cannot be empty'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            # Get user's tasks for context
+            user_tasks = list(Task.objects.filter(
+                user=account,
+                totally_completed=False
+            ).values('id', 'name', 'due_date', 'completed')[:20])
+
+            # Extract tasks from input
+            agent = self.get_agent()
+            prediction = agent.predict_intent(
+                user_input=message,
+                session_id=session_id,
+                user_tasks=user_tasks
+            )
+
+            # Build response
+            response_data = {
+                'success': prediction.success,
+                'intent': prediction.intent,
+                'message': prediction.message,
+                'tasks': [t.model_dump() for t in prediction.tasks],
+                'query_type': prediction.query_type,
+                'needs_confirmation': prediction.needs_confirmation,
+                'session_id': prediction.session_id,
+                'token_report': prediction.token_report,
+                # Legacy compatibility
+                'intent_id': prediction.intent_id,
+                'extracted_params': prediction.extracted_params
+            }
+
+            # Auto-execute based on intent type
+            if auto_execute and prediction.success and not prediction.needs_confirmation:
+                handlers = IntentHandlers(
+                    account=account,
+                    task_model=Task,
+                    project_model=Project,
+                    section_model=Section
+                )
+
+                if prediction.intent == 'create' and prediction.tasks:
+                    # Create multiple tasks
+                    execution_result = self._execute_create_tasks(handlers, prediction.tasks)
+                    response_data['execution'] = execution_result
+                    response_data['message'] = execution_result.get('message', prediction.message)
+
+                elif prediction.intent == 'query':
+                    # Execute query
+                    result = handlers.execute(prediction.intent_id, prediction.extracted_params)
+                    response_data['execution'] = {
+                        'success': result.success,
+                        'action_type': result.action_type.value,
+                        'data': result.data,
+                        'message': result.message,
+                        'error': result.error
+                    }
+                    if result.message:
+                        response_data['message'] = result.message
+
+                elif prediction.intent in ['complete', 'delete', 'update'] and prediction.tasks:
+                    # Execute on task names
+                    result = handlers.execute(prediction.intent_id, {
+                        'task_name': prediction.tasks[0].title if prediction.tasks else ''
+                    })
+                    response_data['execution'] = {
+                        'success': result.success,
+                        'action_type': result.action_type.value,
+                        'data': result.data,
+                        'message': result.message,
+                        'error': result.error
+                    }
+                    if result.message:
+                        response_data['message'] = result.message
+
+            return Response(response_data)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return Response(
+                {'error': f'Failed to process: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def _execute_create_tasks(self, handlers, tasks) -> Dict:
+        """Create multiple tasks and return execution result."""
+        created_tasks = []
+        errors = []
+
+        for task in tasks:
+            try:
+                # Build params for handler
+                params = {
+                    'title': task.title,
+                    'due_date': task.due_date,
+                    'due_time': task.due_time,
+                    'priority': task.priority
+                }
+
+                # Determine which handler to use
+                if task.due_date or task.due_time:
+                    result = handlers.handle_task_create_with_date(params)
+                else:
+                    result = handlers.handle_task_create_simple(params)
+
+                if result.success:
+                    created_tasks.append({
+                        'task_id': result.data.get('task_id'),
+                        'task_name': result.data.get('task_name'),
+                        'due_date': result.data.get('due_date')
+                    })
+                else:
+                    errors.append(result.error)
+
+            except Exception as e:
+                errors.append(str(e))
+
+        # Build result message
+        if created_tasks:
+            task_names = [t['task_name'] for t in created_tasks]
+            if len(task_names) == 1:
+                message = f"Created task: '{task_names[0]}'"
+            else:
+                message = f"Created {len(task_names)} tasks: {', '.join(task_names)}"
+        else:
+            message = "No tasks created"
+
+        return {
+            'success': len(created_tasks) > 0,
+            'action_type': 'insert',
+            'created_tasks': created_tasks,
+            'count': len(created_tasks),
+            'errors': errors,
+            'message': message
+        }
+
+
+class AIIntentExecuteView(APIView):
+    """
+    Execute a specific intent with given params.
+
+    Use this when:
+    - User confirms a destructive action
+    - Manually executing an intent
+    - Replaying an intent with modified params
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        """
+        POST /ai/intent/execute/
+        Execute a specific intent.
+
+        Body:
+        {
+            "intent_id": "task-create-simple",
+            "params": {"title": "My new task"}
+        }
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        intent_id = request.data.get('intent_id', '')
+        params = request.data.get('params', {})
+
+        if not intent_id:
+            return Response(
+                {'error': 'intent_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validate intent exists
+        intent = get_intent_by_id(intent_id)
+        if not intent:
+            return Response(
+                {'error': f'Unknown intent: {intent_id}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            handlers = IntentHandlers(
+                account=account,
+                task_model=Task,
+                project_model=Project,
+                section_model=Section
+            )
+            result = handlers.execute(intent_id, params)
+
+            return Response({
+                'success': result.success,
+                'intent_id': result.intent_id,
+                'action_type': result.action_type.value,
+                'data': result.data,
+                'message': result.message,
+                'error': result.error
+            })
+
+        except Exception as e:
+            return Response(
+                {'error': f'Execution failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class AIIntentListView(APIView):
+    """
+    List all available intents.
+
+    Useful for:
+    - Building UI with available commands
+    - Debugging
+    - API documentation
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        """
+        GET /ai/intent/list/
+        List all available intents.
+        """
+        from .agents.intent_registry import INTENT_REGISTRY, IntentCategory
+
+        category = request.query_params.get('category')
+
+        intents = []
+        for intent_id, intent in INTENT_REGISTRY.items():
+            if category and intent.category.value != category:
+                continue
+
+            intents.append({
+                'id': intent.id,
+                'description': intent.description,
+                'action_type': intent.action_type.value,
+                'category': intent.category.value,
+                'patterns': intent.patterns[:3],  # Sample patterns
+                'requires_params': intent.requires_params,
+                'optional_params': intent.optional_params,
+                'safe': intent.safe
+            })
+
+        # Group by category
+        grouped = {}
+        for intent in intents:
+            cat = intent['category']
+            if cat not in grouped:
+                grouped[cat] = []
+            grouped[cat].append(intent)
+
+        return Response({
+            'intents': intents,
+            'grouped': grouped,
+            'total': len(intents),
+            'categories': [c.value for c in IntentCategory]
+        })
+
+
+class AITaskExtractView(APIView):
+    """
+    Extract tasks from natural language WITHOUT auto-executing.
+
+    Use this for:
+    - Preview what tasks will be created
+    - Let user modify before confirming
+    - UI that shows extracted tasks for approval
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        """
+        POST /ai/extract/
+        Extract tasks from text without creating them.
+
+        Body:
+        {
+            "message": "I want to learn coding, go to gym, and call mom tomorrow"
+        }
+
+        Returns:
+        {
+            "success": true,
+            "intent": "create",
+            "tasks": [
+                {"title": "learn coding", "due_date": null},
+                {"title": "go to gym", "due_date": null},
+                {"title": "call mom", "due_date": "tomorrow"}
+            ],
+            "token_report": {...}
+        }
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        message = request.data.get('message', '').strip()
+        if not message:
+            return Response(
+                {'error': 'Message cannot be empty'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            # Get user's tasks for context
+            user_tasks = list(Task.objects.filter(
+                user=account,
+                totally_completed=False
+            ).values('id', 'name', 'due_date', 'completed')[:20])
+
+            # Extract tasks (no auto-execute)
+            agent = AIIntentChatView.get_agent()
+            prediction = agent.predict_intent(
+                user_input=message,
+                user_tasks=user_tasks
+            )
+
+            return Response({
+                'success': prediction.success,
+                'intent': prediction.intent,
+                'message': prediction.message,
+                'tasks': [t.model_dump() for t in prediction.tasks],
+                'query_type': prediction.query_type,
+                'token_report': prediction.token_report
+            })
+
+        except Exception as e:
+            return Response(
+                {'error': f'Extraction failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class AIBatchCreateView(APIView):
+    """
+    Create multiple tasks from a pre-extracted list.
+
+    Use after AITaskExtractView to create confirmed tasks.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        """
+        POST /ai/batch-create/
+        Create multiple tasks from a list.
+
+        Body:
+        {
+            "tasks": [
+                {"title": "learn coding", "due_date": "tomorrow", "priority": "high"},
+                {"title": "go to gym", "due_date": null, "priority": "medium"},
+                {"title": "call mom", "due_time": "10pm"}
+            ]
+        }
+
+        Returns:
+        {
+            "success": true,
+            "created_tasks": [...],
+            "count": 3,
+            "message": "Created 3 tasks"
+        }
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        tasks_data = request.data.get('tasks', [])
+        if not tasks_data:
+            return Response(
+                {'error': 'No tasks provided'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            handlers = IntentHandlers(
+                account=account,
+                task_model=Task,
+                project_model=Project,
+                section_model=Section
+            )
+
+            created_tasks = []
+            errors = []
+
+            for task_data in tasks_data:
+                title = task_data.get('title', '').strip()
+                if not title:
+                    errors.append("Empty task title skipped")
+                    continue
+
+                params = {
+                    'title': title,
+                    'due_date': task_data.get('due_date'),
+                    'due_time': task_data.get('due_time'),
+                    'priority': task_data.get('priority', 'medium')
+                }
+
+                # Use appropriate handler
+                if params.get('due_date') or params.get('due_time'):
+                    result = handlers.handle_task_create_with_date(params)
+                else:
+                    result = handlers.handle_task_create_simple(params)
+
+                if result.success:
+                    created_tasks.append({
+                        'task_id': result.data.get('task_id'),
+                        'task_name': result.data.get('task_name'),
+                        'due_date': result.data.get('due_date')
+                    })
+                else:
+                    errors.append(result.error)
+
+            # Build response
+            if created_tasks:
+                task_names = [t['task_name'] for t in created_tasks]
+                message = f"Created {len(task_names)} task(s): {', '.join(task_names)}"
+            else:
+                message = "No tasks created"
+
+            return Response({
+                'success': len(created_tasks) > 0,
+                'created_tasks': created_tasks,
+                'count': len(created_tasks),
+                'errors': errors if errors else None,
+                'message': message
+            }, status=status.HTTP_201_CREATED if created_tasks else status.HTTP_400_BAD_REQUEST)
+
+        except Exception as e:
+            return Response(
+                {'error': f'Batch create failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class AIIntentSessionView(APIView):
+    """
+    Manage intent chat sessions.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, session_id):
+        """
+        GET /ai/intent/session/<session_id>/
+        Get session history.
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        agent = AIIntentChatView.get_agent()
+
+        if session_id not in agent.conversations:
+            return Response(
+                {'error': 'Session not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        context = agent.conversations[session_id]
+
+        return Response({
+            'session_id': session_id,
+            'messages': [
+                {
+                    'role': m.role,
+                    'content': m.content,
+                    'timestamp': m.timestamp.isoformat()
+                }
+                for m in context.messages
+            ],
+            'message_count': len(context.messages),
+            'last_intent': context.last_intent_id
+        })
+
+    def delete(self, request, session_id):
+        """
+        DELETE /ai/intent/session/<session_id>/
+        Clear session.
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        agent = AIIntentChatView.get_agent()
+
+        if session_id in agent.conversations:
+            del agent.conversations[session_id]
+            return Response({'message': 'Session cleared', 'session_id': session_id})
+
+        return Response(
+            {'error': 'Session not found'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+
+class AIQuickTaskView(APIView):
+    """
+    Quick single-task creation with smart defaults.
+    Simpler than full intent chat for quick adds.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        """
+        POST /ai/quick-task/
+        Quickly create a task with smart parsing.
+
+        Body:
+        {
+            "text": "buy groceries tomorrow at 5pm"
+        }
+
+        Returns:
+        {
+            "success": true,
+            "task": {
+                "id": "...",
+                "name": "buy groceries",
+                "due_date": "2026-01-24",
+                "due_time": "17:00"
+            }
+        }
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        text = request.data.get('text', '').strip()
+        if not text:
+            return Response(
+                {'error': 'Text cannot be empty'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            # Extract single task using LLM
+            agent = AIIntentChatView.get_agent()
+            prediction = agent.predict_intent(user_input=text)
+
+            # Get first task or use text as title
+            if prediction.tasks:
+                task_data = prediction.tasks[0]
+            else:
+                from .agents.intent_agent import ExtractedTask
+                task_data = ExtractedTask(title=text)
+
+            # Create the task
+            handlers = IntentHandlers(
+                account=account,
+                task_model=Task,
+                project_model=Project,
+                section_model=Section
+            )
+
+            params = {
+                'title': task_data.title,
+                'due_date': task_data.due_date,
+                'due_time': task_data.due_time,
+                'priority': task_data.priority
+            }
+
+            if params.get('due_date') or params.get('due_time'):
+                result = handlers.handle_task_create_with_date(params)
+            else:
+                result = handlers.handle_task_create_simple(params)
+
+            if result.success:
+                return Response({
+                    'success': True,
+                    'task': result.data,
+                    'message': result.message,
+                    'token_report': prediction.token_report
+                }, status=status.HTTP_201_CREATED)
+            else:
+                return Response({
+                    'success': False,
+                    'error': result.error
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+        except Exception as e:
+            return Response(
+                {'error': f'Quick task failed: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )

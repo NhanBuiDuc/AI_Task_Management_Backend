@@ -1,3 +1,5 @@
+# tasks_api\management\commands\setup_periodic_tasks.py
+
 from django.core.management.base import BaseCommand
 from django_celery_beat.models import PeriodicTask, IntervalSchedule, CrontabSchedule
 import json

@@ -27,6 +27,15 @@ class NotificationType(Enum):
     REMINDER = "reminder"
     INSIGHT_GENERATED = "insight_generated"
     PRODUCTIVITY_UPDATE = "productivity_update"
+    # Collaboration notification types
+    COLLABORATION_STARTED = "collaboration_started"
+    COLLABORATION_ENDED = "collaboration_ended"
+    PROJECT_SHARED = "project_shared"
+    PERMISSIONS_UPDATED = "permissions_updated"
+    REMOVED_FROM_PROJECT = "removed_from_project"
+    TASK_SHARED = "task_shared"
+    INVITATION_ACCEPTED = "invitation_accepted"
+    INVITATION_DECLINED = "invitation_declined"
 
 @dataclass
 class Notification:

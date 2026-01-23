@@ -10,7 +10,10 @@ import logging
 import asyncio
 from datetime import datetime, timedelta
 
-from .models import Task, Project, User
+from django.contrib.auth import get_user_model
+from .models import Task, Project
+
+User = get_user_model()
 from .serializers import TaskSerializer, ProjectSerializer
 from .utils.notifications import NotificationService, NotificationPreferences
 from .agents.task_agent import TaskAgent

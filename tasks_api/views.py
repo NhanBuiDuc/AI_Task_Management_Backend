@@ -1,13 +1,15 @@
+# tasks_api\views.py
+
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.utils import timezone
 from datetime import timedelta
 from django.db.models import Q
-from .models import Project, Section, Task, TaskView
+from .models import Account, Project, Section, Task, TaskView
 from .serializers import (
     ProjectSerializer, SectionSerializer, TaskSerializer,
-    CreateTaskSerializer, CreateSectionSerializer
+    CreateTaskSerializer, CreateSectionSerializer, CreateProjectSerializer
 )
 
 
@@ -15,6 +17,30 @@ class ProjectViewSet(viewsets.ModelViewSet):
     """ViewSet for Project model with all required endpoints."""
     queryset = Project.objects.all()
     serializer_class = ProjectSerializer
+
+    def get_queryset(self):
+        """Filter projects by user_id if specified."""
+        queryset = Project.objects.all()
+        user_id = self.request.query_params.get('user_id')
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+        return queryset
+
+    def get_serializer_class(self):
+        """Use CreateProjectSerializer for creation."""
+        if self.action == 'create':
+            return CreateProjectSerializer
+        return ProjectSerializer
+
+    def create(self, request, *args, **kwargs):
+        """Create project and return properly formatted response."""
+        create_serializer = CreateProjectSerializer(data=request.data)
+        create_serializer.is_valid(raise_exception=True)
+        project = create_serializer.save()
+
+        response_serializer = ProjectSerializer(project)
+        headers = self.get_success_headers(response_serializer.data)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
     @action(detail=False, methods=['get'])
     def check_name(self, request):
@@ -90,10 +116,15 @@ class SectionViewSet(viewsets.ModelViewSet):
     serializer_class = SectionSerializer
 
     def get_queryset(self):
-        """Filter sections by project and current_view if specified."""
+        """Filter sections by user_id, project and current_view if specified."""
         queryset = Section.objects.all()
+        user_id = self.request.query_params.get('user_id')
         project_id = self.request.query_params.get('project_id')
         current_view = self.request.query_params.get('current_view')
+
+        # Filter by user_id if specified
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
 
         if project_id is not None:
             if project_id.lower() == 'null':
@@ -179,9 +210,15 @@ class TaskViewSet(viewsets.ModelViewSet):
     serializer_class = TaskSerializer
 
     def get_queryset(self):
-        """Filter tasks by project if specified, excluding totally completed tasks."""
+        """Filter tasks by user_id and project if specified, excluding totally completed tasks."""
         queryset = Task.objects.filter(totally_completed=False)
+        user_id = self.request.query_params.get('user_id')
         project_id = self.request.query_params.get('project_id')
+
+        # Filter by user_id if specified
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+
         if project_id:
             queryset = queryset.filter(project_id=project_id)
         return queryset
@@ -210,6 +247,10 @@ class TaskViewSet(viewsets.ModelViewSet):
         now = timezone.now()
         queryset = Task.objects.filter(due_date__lt=now, completed=False, totally_completed=False)
 
+        user_id = request.query_params.get('user_id')
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+
         project_id = request.query_params.get('project_id')
         if project_id:
             queryset = queryset.filter(project_id=project_id)
@@ -233,6 +274,10 @@ class TaskViewSet(viewsets.ModelViewSet):
             completed=False,
             totally_completed=False
         )
+
+        user_id = request.query_params.get('user_id')
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
 
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
@@ -333,6 +378,7 @@ class TaskViewSet(viewsets.ModelViewSet):
     def by_view(self, request):
         """Get tasks by view."""
         view = request.query_params.get('view')
+        user_id = request.query_params.get('user_id')
         if not view:
             return Response({'error': 'view parameter required'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -352,6 +398,9 @@ class TaskViewSet(viewsets.ModelViewSet):
             task_ids = TaskView.objects.filter(view=view).values_list('task_id', flat=True)
             queryset = Task.objects.filter(id__in=task_ids, totally_completed=False)
 
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
@@ -359,10 +408,13 @@ class TaskViewSet(viewsets.ModelViewSet):
     def by_priority(self, request):
         """Get tasks by priority."""
         priority = request.query_params.get('priority')
+        user_id = request.query_params.get('user_id')
         if not priority:
             return Response({'error': 'priority parameter required'}, status=status.HTTP_400_BAD_REQUEST)
 
         queryset = Task.objects.filter(priority=priority, totally_completed=False)
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
 
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
@@ -371,6 +423,7 @@ class TaskViewSet(viewsets.ModelViewSet):
     def by_due_date(self, request):
         """Get tasks by due date (for Today view)."""
         due_date = request.query_params.get('due_date')
+        user_id = request.query_params.get('user_id')
         if not due_date:
             return Response({'error': 'due_date parameter required'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -380,6 +433,8 @@ class TaskViewSet(viewsets.ModelViewSet):
             target_date = datetime.strptime(due_date, '%Y-%m-%d').date()
 
             queryset = Task.objects.filter(due_date=target_date, totally_completed=False)
+            if user_id:
+                queryset = queryset.filter(user_id=user_id)
             serializer = self.get_serializer(queryset, many=True)
             return Response(serializer.data)
         except ValueError:
@@ -389,6 +444,11 @@ class TaskViewSet(viewsets.ModelViewSet):
     def completed(self, request):
         """Get all totally completed tasks for the Completed page."""
         queryset = Task.objects.filter(totally_completed=True)
+
+        # Optional filter by user_id
+        user_id = request.query_params.get('user_id')
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
 
         # Optional filter by project
         project_id = request.query_params.get('project_id')
@@ -411,6 +471,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         """Get tasks due in a date range (for Upcoming view)."""
         start_date = request.query_params.get('start_date')
         end_date = request.query_params.get('end_date')
+        user_id = request.query_params.get('user_id')
 
         if not start_date or not end_date:
             return Response({'error': 'start_date and end_date parameters required'}, status=status.HTTP_400_BAD_REQUEST)
@@ -427,6 +488,9 @@ class TaskViewSet(viewsets.ModelViewSet):
                 totally_completed=False
             )
 
+            if user_id:
+                queryset = queryset.filter(user_id=user_id)
+
             serializer = self.get_serializer(queryset, many=True)
             return Response(serializer.data)
         except ValueError:
@@ -436,6 +500,9 @@ class TaskViewSet(viewsets.ModelViewSet):
     def counts(self, request):
         """Get task counts for all navigation views."""
         from datetime import datetime, timedelta
+
+        # Get user_id for filtering
+        user_id = request.query_params.get('user_id')
 
         # Get current date for today and upcoming calculations
         # Accept optional today_date parameter to match frontend logic
@@ -462,10 +529,20 @@ class TaskViewSet(viewsets.ModelViewSet):
 
         # Count tasks for each view (excluding totally completed tasks)
         active_tasks = Task.objects.filter(totally_completed=False)
+        if user_id:
+            active_tasks = active_tasks.filter(user_id=user_id)
+
+        # Filter task views by user if specified
+        task_view_filter = {}
+        if user_id:
+            user_task_ids = active_tasks.values_list('id', flat=True)
+            inbox_task_ids = TaskView.objects.filter(view='inbox', task_id__in=user_task_ids).values_list('task_id', flat=True)
+            project_task_ids = TaskView.objects.filter(view='project', task_id__in=user_task_ids).values_list('task_id', flat=True)
+        else:
+            inbox_task_ids = TaskView.objects.filter(view='inbox').values_list('task_id', flat=True)
+            project_task_ids = TaskView.objects.filter(view='project').values_list('task_id', flat=True)
 
         # Inbox: tasks with inbox view BUT NOT project view (non-project tasks only)
-        inbox_task_ids = TaskView.objects.filter(view='inbox').values_list('task_id', flat=True)
-        project_task_ids = TaskView.objects.filter(view='project').values_list('task_id', flat=True)
         inbox_count = active_tasks.filter(
             id__in=inbox_task_ids
         ).exclude(
@@ -485,10 +562,15 @@ class TaskViewSet(viewsets.ModelViewSet):
         overdue_count = active_tasks.filter(due_date__lt=today_date).count()
 
         # Completed: totally completed tasks
-        completed_count = Task.objects.filter(totally_completed=True).count()
+        completed_tasks = Task.objects.filter(totally_completed=True)
+        if user_id:
+            completed_tasks = completed_tasks.filter(user_id=user_id)
+        completed_count = completed_tasks.count()
 
         # Projects: get count for each project (excluding totally completed)
         projects = Project.objects.all()
+        if user_id:
+            projects = projects.filter(user_id=user_id)
         project_counts = {}
         for project in projects:
             project_counts[str(project.id)] = active_tasks.filter(project_id=project.id).count()

@@ -3,7 +3,8 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.decorators import api_view, permission_classes
 from django.core.cache import cache
 from django.utils import timezone
 from django.db import transaction
@@ -13,10 +14,1344 @@ import uuid
 import json
 from datetime import datetime, timedelta
 
-from .models import Task, Project, Section, User
-from .serializers import TaskSerializer, ProjectSerializer, UserSerializer
+from django.contrib.auth import get_user_model
+from .models import (
+    Task, Project, Section, Account,
+    TaskCollaboration, TaskInvitation, ProjectCollaboration
+)
+from .serializers import (
+    TaskSerializer, ProjectSerializer,
+    TaskCollaborationSerializer, TaskInvitationSerializer,
+    CreateTaskInvitationSerializer, InvitationResponseSerializer,
+    UpdateCollaborationPermissionSerializer, SharedTaskSerializer,
+    CollaboratorSerializer
+)
+
+User = get_user_model()
 from .utils.notifications import NotificationService, Notification, NotificationType
 from .utils.analytics import AnalyticsTracker
+
+
+# ============================================
+# Helper function to get account from request
+# ============================================
+
+def get_account_from_request(request):
+    """
+    Get account from request. Uses X-Account-ID header for simple auth.
+    In production, this should use proper JWT/session authentication.
+    """
+    account_id = request.headers.get('X-Account-ID')
+    if not account_id:
+        return None
+    try:
+        return Account.objects.get(id=account_id, is_active=True)
+    except (Account.DoesNotExist, ValueError):
+        return None
+
+
+# ============================================
+# Task Invitation Views
+# ============================================
+
+class TaskInvitationView(APIView):
+    """
+    Manage task collaboration invitations.
+
+    POST - Send a new invitation
+    GET - List invitations (sent or received)
+    """
+    permission_classes = [AllowAny]  # Using custom auth via header
+
+    def get(self, request):
+        """
+        GET /api/collaboration/invitations/
+        List invitations sent by or received by the user.
+
+        Query params:
+        - type: 'sent' or 'received' (default: 'received')
+        - status: 'pending', 'accepted', 'declined', 'all' (default: 'pending')
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        invitation_type = request.query_params.get('type', 'received')
+        status_filter = request.query_params.get('status', 'pending')
+
+        if invitation_type == 'sent':
+            invitations = TaskInvitation.objects.filter(invited_by=account)
+        else:
+            invitations = TaskInvitation.objects.filter(invitee=account)
+
+        if status_filter != 'all':
+            invitations = invitations.filter(status=status_filter)
+
+        invitations = invitations.select_related(
+            'task', 'invited_by', 'invitee'
+        ).order_by('-created_at')
+
+        serializer = TaskInvitationSerializer(invitations, many=True)
+        return Response({
+            'invitations': serializer.data,
+            'count': invitations.count()
+        })
+
+    def post(self, request):
+        """
+        POST /api/collaboration/invitations/
+        Send a new task collaboration invitation.
+
+        Body:
+        {
+            "task_id": "uuid",
+            "invitee_id": "uuid" (optional),
+            "invitee_email": "email@example.com" (optional),
+            "permission": "view" | "edit" | "admin",
+            "message": "Optional invitation message"
+        }
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        serializer = CreateTaskInvitationSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+        task_id = data['task_id']
+
+        # Verify task exists and user has permission to share it
+        try:
+            task = Task.objects.get(id=task_id)
+        except Task.DoesNotExist:
+            return Response(
+                {'error': 'Task not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if user owns the task or has admin permission
+        if task.user != account:
+            collaboration = TaskCollaboration.objects.filter(
+                task=task, collaborator=account, is_active=True
+            ).first()
+            if not collaboration or not collaboration.can_admin():
+                return Response(
+                    {'error': 'You do not have permission to share this task'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        # Find or validate invitee
+        invitee = None
+        invitee_email = data.get('invitee_email')
+
+        if data.get('invitee_id'):
+            try:
+                invitee = Account.objects.get(id=data['invitee_id'], is_active=True)
+            except Account.DoesNotExist:
+                return Response(
+                    {'error': 'Invitee not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        elif invitee_email:
+            # Try to find user by email
+            invitee = Account.objects.filter(email=invitee_email, is_active=True).first()
+
+        # Cannot invite yourself
+        if invitee and invitee == account:
+            return Response(
+                {'error': 'You cannot invite yourself'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Check for existing pending invitation
+        existing = TaskInvitation.objects.filter(
+            task=task,
+            status='pending'
+        )
+        if invitee:
+            existing = existing.filter(invitee=invitee)
+        elif invitee_email:
+            existing = existing.filter(invitee_email=invitee_email)
+
+        if existing.exists():
+            return Response(
+                {'error': 'An invitation is already pending for this user'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Check if already a collaborator
+        if invitee:
+            existing_collab = TaskCollaboration.objects.filter(
+                task=task, collaborator=invitee, is_active=True
+            ).exists()
+            if existing_collab:
+                return Response(
+                    {'error': 'User is already a collaborator on this task'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # Create invitation
+        invitation = TaskInvitation.objects.create(
+            task=task,
+            invited_by=account,
+            invitee=invitee,
+            invitee_email=invitee_email if not invitee else None,
+            permission=data['permission'],
+            message=data.get('message', ''),
+            expires_at=timezone.now() + timedelta(days=7)  # 7 day expiry
+        )
+
+        # Send notification if invitee exists
+        if invitee:
+            try:
+                NotificationService.send_notification(
+                    Notification(
+                        type=NotificationType.TASK_SHARED,
+                        user_id=invitee.id,
+                        data={
+                            'invitation_id': str(invitation.id),
+                            'task_id': str(task.id),
+                            'task_name': task.name,
+                            'invited_by': account.display_name or account.username,
+                            'permission': data['permission']
+                        }
+                    )
+                )
+            except Exception:
+                pass  # Don't fail if notification fails
+
+        serializer = TaskInvitationSerializer(invitation)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class TaskInvitationResponseView(APIView):
+    """
+    Respond to a task invitation (accept/decline).
+
+    POST /api/collaboration/invitations/<invitation_id>/respond/
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request, invitation_id):
+        """
+        Accept or decline an invitation.
+
+        Body:
+        {
+            "action": "accept" | "decline"
+        }
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            invitation = TaskInvitation.objects.get(id=invitation_id)
+        except TaskInvitation.DoesNotExist:
+            return Response(
+                {'error': 'Invitation not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Verify the user is the invitee
+        if invitation.invitee != account:
+            return Response(
+                {'error': 'You are not the invitee for this invitation'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = InvitationResponseSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        action = serializer.validated_data['action']
+
+        if action == 'accept':
+            collaboration = invitation.accept()
+            if not collaboration:
+                return Response(
+                    {'error': 'Invitation is no longer valid'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Notify the inviter
+            try:
+                NotificationService.send_notification(
+                    Notification(
+                        type=NotificationType.INVITATION_ACCEPTED,
+                        user_id=invitation.invited_by.id,
+                        data={
+                            'task_id': str(invitation.task.id),
+                            'task_name': invitation.task.name,
+                            'accepted_by': account.display_name or account.username
+                        }
+                    )
+                )
+            except Exception:
+                pass
+
+            return Response({
+                'message': 'Invitation accepted',
+                'collaboration': TaskCollaborationSerializer(collaboration).data
+            })
+
+        else:  # decline
+            if not invitation.decline():
+                return Response(
+                    {'error': 'Invitation is no longer valid'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            return Response({'message': 'Invitation declined'})
+
+
+class TaskInvitationCancelView(APIView):
+    """
+    Cancel a sent invitation.
+
+    DELETE /api/collaboration/invitations/<invitation_id>/
+    """
+    permission_classes = [AllowAny]
+
+    def delete(self, request, invitation_id):
+        """Cancel a pending invitation."""
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            invitation = TaskInvitation.objects.get(id=invitation_id)
+        except TaskInvitation.DoesNotExist:
+            return Response(
+                {'error': 'Invitation not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Verify the user is the inviter
+        if invitation.invited_by != account:
+            return Response(
+                {'error': 'You can only cancel invitations you sent'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        if not invitation.cancel():
+            return Response(
+                {'error': 'Invitation cannot be cancelled'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return Response({'message': 'Invitation cancelled'})
+
+
+# ============================================
+# Task Collaboration Views
+# ============================================
+
+class TaskCollaboratorsView(APIView):
+    """
+    Manage collaborators for a task.
+
+    GET - List collaborators for a task
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, task_id):
+        """
+        GET /api/collaboration/tasks/<task_id>/collaborators/
+        List all collaborators for a task.
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            task = Task.objects.get(id=task_id)
+        except Task.DoesNotExist:
+            return Response(
+                {'error': 'Task not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if user has access to the task
+        if task.user != account:
+            collaboration = TaskCollaboration.objects.filter(
+                task=task, collaborator=account, is_active=True
+            ).first()
+            if not collaboration:
+                return Response(
+                    {'error': 'You do not have access to this task'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        collaborations = TaskCollaboration.objects.filter(
+            task=task, is_active=True
+        ).select_related('collaborator', 'owner')
+
+        serializer = TaskCollaborationSerializer(collaborations, many=True)
+
+        # Also include the owner
+        owner_data = CollaboratorSerializer(task.user).data
+        owner_data['permission'] = 'owner'
+
+        return Response({
+            'owner': owner_data,
+            'collaborators': serializer.data,
+            'count': collaborations.count()
+        })
+
+
+class TaskCollaborationUpdateView(APIView):
+    """
+    Update or remove a collaboration.
+
+    PATCH - Update collaboration permission
+    DELETE - Remove collaboration
+    """
+    permission_classes = [AllowAny]
+
+    def patch(self, request, collaboration_id):
+        """
+        PATCH /api/collaboration/collaborations/<collaboration_id>/
+        Update collaboration permission.
+
+        Body:
+        {
+            "permission": "view" | "edit" | "admin"
+        }
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            collaboration = TaskCollaboration.objects.select_related('task').get(
+                id=collaboration_id
+            )
+        except TaskCollaboration.DoesNotExist:
+            return Response(
+                {'error': 'Collaboration not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if user has admin permission
+        task = collaboration.task
+        if task.user != account:
+            user_collab = TaskCollaboration.objects.filter(
+                task=task, collaborator=account, is_active=True
+            ).first()
+            if not user_collab or not user_collab.can_admin():
+                return Response(
+                    {'error': 'You do not have permission to modify collaborators'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        serializer = UpdateCollaborationPermissionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        collaboration.permission = serializer.validated_data['permission']
+        collaboration.save(update_fields=['permission', 'updated_at'])
+
+        return Response({
+            'message': 'Permission updated',
+            'collaboration': TaskCollaborationSerializer(collaboration).data
+        })
+
+    def delete(self, request, collaboration_id):
+        """
+        DELETE /api/collaboration/collaborations/<collaboration_id>/
+        Remove a collaboration.
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            collaboration = TaskCollaboration.objects.select_related('task').get(
+                id=collaboration_id
+            )
+        except TaskCollaboration.DoesNotExist:
+            return Response(
+                {'error': 'Collaboration not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        task = collaboration.task
+
+        # Allow removal if:
+        # 1. User is the task owner
+        # 2. User has admin permission
+        # 3. User is removing themselves
+        can_remove = False
+        if task.user == account:
+            can_remove = True
+        elif collaboration.collaborator == account:
+            can_remove = True  # User can leave a collaboration
+        else:
+            user_collab = TaskCollaboration.objects.filter(
+                task=task, collaborator=account, is_active=True
+            ).first()
+            if user_collab and user_collab.can_admin():
+                can_remove = True
+
+        if not can_remove:
+            return Response(
+                {'error': 'You do not have permission to remove this collaborator'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Soft delete by marking inactive
+        collaboration.is_active = False
+        collaboration.save(update_fields=['is_active', 'updated_at'])
+
+        # Notify the removed collaborator
+        try:
+            NotificationService.send_notification(
+                Notification(
+                    type=NotificationType.REMOVED_FROM_PROJECT,  # Reusing type
+                    user_id=collaboration.collaborator.id,
+                    data={
+                        'task_id': str(task.id),
+                        'task_name': task.name,
+                        'removed_by': account.display_name or account.username
+                    }
+                )
+            )
+        except Exception:
+            pass
+
+        return Response({'message': 'Collaborator removed'})
+
+
+# ============================================
+# Shared Tasks View
+# ============================================
+
+class SharedTasksView(APIView):
+    """
+    List tasks shared with the user.
+
+    GET /api/collaboration/shared-tasks/
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        """
+        Get all tasks that have been shared with the user.
+
+        Query params:
+        - permission: Filter by permission level ('view', 'edit', 'admin')
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        permission_filter = request.query_params.get('permission')
+
+        collaborations = TaskCollaboration.objects.filter(
+            collaborator=account,
+            is_active=True
+        ).select_related('task', 'task__user', 'task__project', 'task__section')
+
+        if permission_filter:
+            collaborations = collaborations.filter(permission=permission_filter)
+
+        # Get task IDs from collaborations
+        task_ids = collaborations.values_list('task_id', flat=True)
+        tasks = Task.objects.filter(
+            id__in=task_ids,
+            totally_completed=False
+        ).prefetch_related('task_views', 'collaborations')
+
+        # Add request to context for permission lookup
+        request.account = account
+        serializer = SharedTaskSerializer(
+            tasks, many=True, context={'request': request}
+        )
+
+        return Response({
+            'tasks': serializer.data,
+            'count': tasks.count()
+        })
+
+
+# ============================================
+# User Search for Collaboration
+# ============================================
+
+class UserSearchView(APIView):
+    """
+    Search for users to invite for collaboration.
+
+    GET /api/collaboration/users/search/
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        """
+        Search for users by username or email.
+
+        Query params:
+        - q: Search query (required, min 2 characters)
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        query = request.query_params.get('q', '').strip()
+        if len(query) < 2:
+            return Response(
+                {'error': 'Search query must be at least 2 characters'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        users = Account.objects.filter(
+            Q(username__icontains=query) |
+            Q(email__icontains=query) |
+            Q(display_name__icontains=query),
+            is_active=True
+        ).exclude(id=account.id)[:10]
+
+        serializer = CollaboratorSerializer(users, many=True)
+        return Response({
+            'users': serializer.data,
+            'count': len(serializer.data)
+        })
+
+
+# ============================================
+# Project Collaboration Views (Role-based)
+# ============================================
+
+class JoinProjectView(APIView):
+    """
+    Join a project using access_id.
+
+    POST /api/collaboration/projects/join/
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        """
+        Join a project using its access_id.
+
+        Body:
+        {
+            "access_id": "ABC12345"
+        }
+        """
+        from .serializers import JoinProjectSerializer, ProjectCollaborationSerializer
+
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        serializer = JoinProjectSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        access_id = serializer.validated_data['access_id'].upper()
+
+        # Find project by access_id
+        try:
+            project = Project.objects.get(access_id=access_id)
+        except Project.DoesNotExist:
+            return Response(
+                {'error': 'Invalid access code'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if user is already the owner
+        if project.user == account:
+            return Response(
+                {'error': 'You are the owner of this project'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Check if already a collaborator
+        existing = ProjectCollaboration.objects.filter(
+            project=project, collaborator=account
+        ).first()
+
+        if existing:
+            if existing.is_active:
+                return Response(
+                    {'error': 'You are already a collaborator on this project'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            else:
+                # Reactivate
+                existing.is_active = True
+                existing.joined_at = timezone.now()
+                existing.save()
+                collaboration = existing
+        else:
+            # Create new collaboration as collaborator (lowest role)
+            collaboration = ProjectCollaboration.objects.create(
+                project=project,
+                collaborator=account,
+                role='collaborator',
+                is_active=True,
+                joined_at=timezone.now()
+            )
+
+        # Enable collaborative mode
+        if not project.is_collaborative:
+            project.is_collaborative = True
+            project.save(update_fields=['is_collaborative', 'updated_at'])
+
+        # Notify project owner
+        try:
+            NotificationService.send_notification(
+                Notification(
+                    type=NotificationType.PROJECT_SHARED,
+                    user_id=project.user.id,
+                    data={
+                        'project_id': str(project.id),
+                        'project_name': project.name,
+                        'joined_by': account.display_name or account.username
+                    }
+                )
+            )
+        except Exception:
+            pass
+
+        return Response({
+            'message': 'Successfully joined project',
+            'collaboration': ProjectCollaborationSerializer(collaboration).data,
+            'project': {
+                'id': str(project.id),
+                'name': project.name,
+                'owner': {
+                    'id': str(project.user.id),
+                    'username': project.user.username,
+                    'display_name': project.user.display_name
+                }
+            }
+        }, status=status.HTTP_201_CREATED)
+
+
+class ProjectCollaboratorsView(APIView):
+    """
+    Manage collaborators for a project.
+
+    GET - List all collaborators
+    POST - Invite a new collaborator
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, project_id):
+        """
+        GET /api/collaboration/projects/<project_id>/collaborators/
+        List all collaborators for a project including the owner.
+        """
+        from .serializers import ProjectCollaborationSerializer
+
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            project = Project.objects.get(id=project_id)
+        except Project.DoesNotExist:
+            return Response(
+                {'error': 'Project not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if user has access
+        is_owner = project.user == account
+        is_collaborator = ProjectCollaboration.objects.filter(
+            project=project, collaborator=account, is_active=True
+        ).exists()
+
+        if not is_owner and not is_collaborator:
+            return Response(
+                {'error': 'You do not have access to this project'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        collaborations = ProjectCollaboration.objects.filter(
+            project=project, is_active=True
+        ).select_related('collaborator')
+
+        # Build response with owner info
+        owner_data = CollaboratorSerializer(project.user).data
+        owner_data['role'] = 'owner'
+
+        return Response({
+            'owner': owner_data,
+            'collaborators': ProjectCollaborationSerializer(collaborations, many=True).data,
+            'access_id': project.access_id if is_owner else None,
+            'count': collaborations.count()
+        })
+
+
+class ProjectCollaboratorDetailView(APIView):
+    """
+    Update or remove a project collaborator.
+
+    PATCH - Update collaborator role
+    DELETE - Remove collaborator
+    """
+    permission_classes = [AllowAny]
+
+    def patch(self, request, project_id, collaborator_id):
+        """
+        PATCH /api/collaboration/projects/<project_id>/collaborators/<collaborator_id>/
+        Update collaborator role (only owner can do this).
+
+        Body:
+        {
+            "role": "moderator" | "collaborator"
+        }
+        """
+        from .serializers import UpdateProjectRoleSerializer, ProjectCollaborationSerializer
+
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            project = Project.objects.get(id=project_id)
+        except Project.DoesNotExist:
+            return Response(
+                {'error': 'Project not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Only owner can change roles
+        if project.user != account:
+            return Response(
+                {'error': 'Only the project owner can change roles'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            collaboration = ProjectCollaboration.objects.get(
+                project=project, collaborator_id=collaborator_id, is_active=True
+            )
+        except ProjectCollaboration.DoesNotExist:
+            return Response(
+                {'error': 'Collaborator not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = UpdateProjectRoleSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        collaboration.role = serializer.validated_data['role']
+        collaboration.save(update_fields=['role', 'updated_at'])
+
+        # Notify the collaborator
+        try:
+            NotificationService.send_notification(
+                Notification(
+                    type=NotificationType.PERMISSIONS_UPDATED,
+                    user_id=collaboration.collaborator.id,
+                    data={
+                        'project_id': str(project.id),
+                        'project_name': project.name,
+                        'new_role': collaboration.role
+                    }
+                )
+            )
+        except Exception:
+            pass
+
+        return Response({
+            'message': 'Role updated',
+            'collaboration': ProjectCollaborationSerializer(collaboration).data
+        })
+
+    def delete(self, request, project_id, collaborator_id):
+        """
+        DELETE /api/collaboration/projects/<project_id>/collaborators/<collaborator_id>/
+        Remove a collaborator from the project.
+        """
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required. Provide X-Account-ID header.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            project = Project.objects.get(id=project_id)
+        except Project.DoesNotExist:
+            return Response(
+                {'error': 'Project not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        try:
+            collaboration = ProjectCollaboration.objects.get(
+                project=project, collaborator_id=collaborator_id
+            )
+        except ProjectCollaboration.DoesNotExist:
+            return Response(
+                {'error': 'Collaborator not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Allow removal if:
+        # 1. User is the project owner
+        # 2. User is removing themselves (leaving the project)
+        is_owner = project.user == account
+        is_self = str(collaborator_id) == str(account.id)
+
+        if not is_owner and not is_self:
+            return Response(
+                {'error': 'You can only remove yourself or be the owner to remove others'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Soft delete
+        collaboration.is_active = False
+        collaboration.save(update_fields=['is_active', 'updated_at'])
+
+        # Notify if owner removed someone
+        if is_owner and not is_self:
+            try:
+                NotificationService.send_notification(
+                    Notification(
+                        type=NotificationType.REMOVED_FROM_PROJECT,
+                        user_id=collaboration.collaborator.id,
+                        data={
+                            'project_id': str(project.id),
+                            'project_name': project.name
+                        }
+                    )
+                )
+            except Exception:
+                pass
+
+        return Response({'message': 'Collaborator removed'})
+
+
+class ProjectAccessIdView(APIView):
+    """
+    Manage project access_id.
+
+    GET - Get current access_id
+    POST - Regenerate access_id
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, project_id):
+        """Get project access_id (owner only)."""
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            project = Project.objects.get(id=project_id)
+        except Project.DoesNotExist:
+            return Response(
+                {'error': 'Project not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if project.user != account:
+            return Response(
+                {'error': 'Only the owner can view the access code'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        return Response({
+            'access_id': project.access_id,
+            'is_collaborative': project.is_collaborative
+        })
+
+    def post(self, request, project_id):
+        """Regenerate project access_id (owner only)."""
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            project = Project.objects.get(id=project_id)
+        except Project.DoesNotExist:
+            return Response(
+                {'error': 'Project not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if project.user != account:
+            return Response(
+                {'error': 'Only the owner can regenerate the access code'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        new_access_id = project.regenerate_access_id()
+
+        return Response({
+            'message': 'Access code regenerated',
+            'access_id': new_access_id
+        })
+
+
+class TransferOwnershipView(APIView):
+    """
+    Transfer project ownership to another collaborator.
+
+    POST /api/collaboration/projects/<project_id>/transfer/
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request, project_id):
+        """
+        Transfer ownership to another user.
+
+        Body:
+        {
+            "new_owner_id": "uuid"
+        }
+        """
+        from .serializers import TransferOwnershipSerializer
+
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            project = Project.objects.get(id=project_id)
+        except Project.DoesNotExist:
+            return Response(
+                {'error': 'Project not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if project.user != account:
+            return Response(
+                {'error': 'Only the owner can transfer ownership'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = TransferOwnershipSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        new_owner_id = serializer.validated_data['new_owner_id']
+
+        # Find new owner (must be a collaborator)
+        try:
+            new_owner = Account.objects.get(id=new_owner_id, is_active=True)
+        except Account.DoesNotExist:
+            return Response(
+                {'error': 'User not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Verify new owner is a collaborator
+        is_collaborator = ProjectCollaboration.objects.filter(
+            project=project, collaborator=new_owner, is_active=True
+        ).exists()
+
+        if not is_collaborator:
+            return Response(
+                {'error': 'New owner must be a collaborator on the project'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Transfer ownership
+        project.transfer_ownership(new_owner)
+
+        # Notify new owner
+        try:
+            NotificationService.send_notification(
+                Notification(
+                    type=NotificationType.PERMISSIONS_UPDATED,
+                    user_id=new_owner.id,
+                    data={
+                        'project_id': str(project.id),
+                        'project_name': project.name,
+                        'message': 'You are now the owner of this project'
+                    }
+                )
+            )
+        except Exception:
+            pass
+
+        return Response({
+            'message': 'Ownership transferred successfully',
+            'new_owner': {
+                'id': str(new_owner.id),
+                'username': new_owner.username,
+                'display_name': new_owner.display_name
+            }
+        })
+
+
+class TaskAssignmentView(APIView):
+    """
+    Assign users to a task.
+
+    GET - Get assigned users
+    POST - Assign users to task
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, task_id):
+        """Get users assigned to a task."""
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            task = Task.objects.get(id=task_id)
+        except Task.DoesNotExist:
+            return Response(
+                {'error': 'Task not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check access
+        if not self._has_task_access(task, account):
+            return Response(
+                {'error': 'You do not have access to this task'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        assigned_users = task.assigned_to.all()
+        return Response({
+            'assigned_to': CollaboratorSerializer(assigned_users, many=True).data,
+            'count': assigned_users.count()
+        })
+
+    def post(self, request, task_id):
+        """
+        Assign users to a task.
+
+        Body:
+        {
+            "user_ids": ["uuid1", "uuid2"]
+        }
+        """
+        from .serializers import AssignTaskSerializer
+
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        try:
+            task = Task.objects.get(id=task_id)
+        except Task.DoesNotExist:
+            return Response(
+                {'error': 'Task not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if user can assign (owner or moderator)
+        if not self._can_assign_task(task, account):
+            return Response(
+                {'error': 'You do not have permission to assign users to this task'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = AssignTaskSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        user_ids = serializer.validated_data['user_ids']
+
+        # Validate that all users are collaborators on the project
+        if task.project:
+            valid_collaborator_ids = set(
+                ProjectCollaboration.objects.filter(
+                    project=task.project, is_active=True
+                ).values_list('collaborator_id', flat=True)
+            )
+            # Also include project owner
+            valid_collaborator_ids.add(task.project.user.id)
+
+            invalid_ids = [uid for uid in user_ids if uid not in valid_collaborator_ids]
+            if invalid_ids:
+                return Response(
+                    {'error': 'Some users are not collaborators on this project'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # Update assignments
+        task.assigned_to.clear()
+        if user_ids:
+            users_to_assign = Account.objects.filter(id__in=user_ids, is_active=True)
+            task.assigned_to.add(*users_to_assign)
+
+            # Notify assigned users
+            for user in users_to_assign:
+                if user != account:
+                    try:
+                        NotificationService.send_notification(
+                            Notification(
+                                type=NotificationType.TASK_SHARED,
+                                user_id=user.id,
+                                data={
+                                    'task_id': str(task.id),
+                                    'task_name': task.name,
+                                    'assigned_by': account.display_name or account.username
+                                }
+                            )
+                        )
+                    except Exception:
+                        pass
+
+        return Response({
+            'message': 'Task assignments updated',
+            'assigned_to': CollaboratorSerializer(task.assigned_to.all(), many=True).data
+        })
+
+    def _has_task_access(self, task, account):
+        """Check if user has read access to the task."""
+        # Owner of the task
+        if task.user == account:
+            return True
+
+        # Project owner or collaborator
+        if task.project:
+            if task.project.user == account:
+                return True
+            return ProjectCollaboration.objects.filter(
+                project=task.project, collaborator=account, is_active=True
+            ).exists()
+
+        return False
+
+    def _can_assign_task(self, task, account):
+        """Check if user can assign people to the task."""
+        # Task owner
+        if task.user == account:
+            return True
+
+        # Project owner
+        if task.project and task.project.user == account:
+            return True
+
+        # Moderator
+        if task.project:
+            collab = ProjectCollaboration.objects.filter(
+                project=task.project, collaborator=account, is_active=True
+            ).first()
+            return collab and collab.role == 'moderator'
+
+        return False
+
+
+class CollaborativeProjectsView(APIView):
+    """
+    Get all collaborative projects for the current user.
+
+    GET /api/collaboration/projects/
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        """Get all projects the user owns or collaborates on."""
+        from .serializers import ProjectSerializer
+
+        account = get_account_from_request(request)
+        if not account:
+            return Response(
+                {'error': 'Authentication required'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        filter_type = request.query_params.get('filter', 'all')
+
+        if filter_type == 'owned':
+            # Projects owned by user that have collaborators
+            projects = Project.objects.filter(
+                user=account, is_collaborative=True
+            )
+        elif filter_type == 'shared':
+            # Projects shared with user
+            project_ids = ProjectCollaboration.objects.filter(
+                collaborator=account, is_active=True
+            ).values_list('project_id', flat=True)
+            projects = Project.objects.filter(id__in=project_ids)
+        else:
+            # All collaborative projects (owned or shared)
+            owned_ids = Project.objects.filter(
+                user=account, is_collaborative=True
+            ).values_list('id', flat=True)
+            collab_ids = ProjectCollaboration.objects.filter(
+                collaborator=account, is_active=True
+            ).values_list('project_id', flat=True)
+            all_ids = set(owned_ids) | set(collab_ids)
+            projects = Project.objects.filter(id__in=all_ids)
+
+        # Add role info to each project
+        results = []
+        for project in projects:
+            project_data = ProjectSerializer(project).data
+            if project.user == account:
+                project_data['my_role'] = 'owner'
+            else:
+                collab = ProjectCollaboration.objects.filter(
+                    project=project, collaborator=account, is_active=True
+                ).first()
+                project_data['my_role'] = collab.role if collab else None
+            results.append(project_data)
+
+        return Response({
+            'projects': results,
+            'count': len(results)
+        })
+
 
 class CollaborationSessionView(APIView):
     """

@@ -1,435 +1,717 @@
+# tasks_api/agents/task_agent.py
 """
-LangChain-based Task Agent using Local Ollama
-Handles natural language input and converts to structured tasks
+Efficient Task Agent with conversation support and task suggestions.
+Handles natural language for CRUD operations on tasks with minimal tokens.
 """
 
-from langchain.llms import Ollama
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Literal
 import json
 import logging
 import requests
+import uuid
 from datetime import datetime, timedelta
+from enum import Enum
 
-# Configure logging
+# LangChain imports
+LANGCHAIN_AVAILABLE = False
+try:
+    from langchain_ollama import OllamaLLM
+    from langchain_core.prompts import PromptTemplate
+    LANGCHAIN_AVAILABLE = True
+except ImportError:
+    OllamaLLM = None
+    PromptTemplate = None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# Enums and Constants
+# =============================================================================
+
+class ActionType(str, Enum):
+    """Task actions that can be performed"""
+    READ = "read"
+    INSERT = "insert"
+    UPDATE = "update"
+    DELETE = "delete"
+    COMPLETE = "complete"
+
+
+class ResponseType(str, Enum):
+    """Type of agent response"""
+    ACTIONS = "actions"          # Has database actions to execute
+    CLARIFY = "clarify"          # Needs clarification from user
+    SUGGEST = "suggest"          # Has task suggestions for approval
+    CHAT = "chat"                # General conversation response
+
+
+# =============================================================================
+# Pydantic Models
+# =============================================================================
+
+class TaskAction(BaseModel):
+    """Single task action with all necessary data"""
+    action: ActionType
+    task_id: Optional[str] = None  # Required for update/delete/complete/read
+    title: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    priority: Optional[int] = Field(default=None, ge=1, le=5)
+    due_date: Optional[str] = None  # YYYY-MM-DD
+    due_time: Optional[str] = None  # HH:MM
+    duration: Optional[int] = None  # minutes
+    frequency: Optional[str] = None
+    # For read queries
+    query_type: Optional[str] = None  # "count", "list", "due_date", "details"
+    query_filter: Optional[str] = None  # "today", "overdue", "all", specific task name
+
+
+class TaskSuggestion(BaseModel):
+    """Task suggestion waiting for user approval"""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    title: str
+    description: Optional[str] = None
+    category: str = "personal"
+    priority: int = 3
+    due_date: Optional[str] = None
+    duration: int = 30
+    frequency: str = "once"
+    reason: str = ""  # Why this task is suggested
+
+
+class AgentResponse(BaseModel):
+    """Complete response from the agent"""
+    type: ResponseType
+    message: str  # User-friendly message
+    actions: List[TaskAction] = Field(default_factory=list)
+    suggestions: List[TaskSuggestion] = Field(default_factory=list)
+    clarify_options: List[str] = Field(default_factory=list)  # Options for clarification
+    context_key: Optional[str] = None  # To track conversation context
+
+
+class ConversationMessage(BaseModel):
+    """Single message in conversation history"""
+    role: Literal["user", "assistant"]
+    content: str
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
+class ConversationContext(BaseModel):
+    """Maintains conversation state"""
+    session_id: str
+    messages: List[ConversationMessage] = Field(default_factory=list)
+    pending_suggestions: List[TaskSuggestion] = Field(default_factory=list)
+    awaiting_clarification: bool = False
+    clarification_topic: Optional[str] = None
+
+
+# =============================================================================
+# Legacy Models (for backward compatibility)
+# =============================================================================
+
 class TaskItem(BaseModel):
-    """Structured task item extracted from user intentions"""
-    title: str = Field(description="Clear, actionable task title")
-    category: str = Field(description="Category: work, education, health, personal, social, finance")
-    priority: int = Field(description="Priority 1-5, where 5 is highest urgency")
-    frequency: str = Field(description="Frequency: daily, weekly, monthly, once")
-    duration: int = Field(description="Estimated duration in minutes")
-    time_preference: str = Field(description="Preferred time: morning, afternoon, evening, anytime")
-    energy_level: str = Field(description="Required energy: high, medium, low")
-    deadline_urgency: str = Field(description="Deadline urgency: urgent, normal, flexible")
+    """Legacy task item for backward compatibility"""
+    title: str
+    category: str = "personal"
+    priority: int = 3
+    frequency: str = "once"
+    duration: int = 30
+    time_preference: str = "anytime"
+    energy_level: str = "medium"
+    due_date: Optional[str] = None
+    due_time: Optional[str] = None
+
 
 class TaskExtractionOutput(BaseModel):
-    """Complete output from task extraction process"""
-    tasks: List[TaskItem]
-    insights: List[str] = Field(description="Insights about the schedule and recommendations")
-    total_estimated_time: int = Field(description="Total time in minutes per week")
-    feasibility_score: float = Field(description="Feasibility score 0-10")
+    """Legacy output format for backward compatibility"""
+    tasks: List[TaskItem] = Field(default_factory=list)
+    insights: List[str] = Field(default_factory=list)
+    total_estimated_time: int = 0
+    feasibility_score: float = 8.0
+
+
+# =============================================================================
+# Main Task Agent
+# =============================================================================
 
 class TaskAgent:
     """
-    Main Task Agent class using local Ollama for intelligent task processing
-    Processes natural language intentions and converts them into structured tasks
+    Efficient Task Agent with conversation support.
+    Processes natural language and returns structured actions or suggestions.
     """
-    
+
+    # Compact system prompt - optimized for token efficiency
+    SYSTEM_PROMPT = """Task assistant. Parse user input, return JSON only.
+
+TODAY={today}
+TASKS={tasks_context}
+
+OUTPUT FORMAT:
+{{"type":"actions|clarify|suggest","message":"user response","actions":[...],"suggestions":[...],"clarify_options":[...]}}
+
+ACTIONS (when user wants to do something):
+- read: {{"action":"read","query_type":"count|list|due_date","query_filter":"today|overdue|task_name"}}
+- insert: {{"action":"insert","title":"x","category":"work|education|health|personal|social|finance","priority":1-5,"due_date":"YYYY-MM-DD","duration":mins}}
+- update: {{"action":"update","task_id":"id|null","title":"task to find","due_date":"new date",...}}
+- delete: {{"action":"delete","task_id":"id|null","title":"task to find"}}
+- complete: {{"action":"complete","task_id":"id|null","title":"task to find"}}
+
+CLARIFY (when input is ambiguous):
+{{"type":"clarify","message":"What type of X?","clarify_options":["option1","option2","option3"]}}
+
+SUGGEST (when planning/brainstorming):
+{{"type":"suggest","message":"Here's a plan","suggestions":[{{"title":"x","category":"y","reason":"why"}}]}}
+
+DATE CALC: tomorrow=+1, this week=nearest weekday, next week=+7, in N days=+N
+
+INPUT:{input}
+JSON:"""
+
     def __init__(self, model_name: str = "llama3.2", base_url: str = "http://localhost:11434"):
-        """Initialize the agent with Ollama configuration"""
         self.model_name = model_name
         self.base_url = base_url
-        
-        # Initialize Ollama LLM
-        self.llm = Ollama(
-            model=model_name,
-            base_url=base_url,
-            temperature=0.3,
-            num_predict=1500,
-            timeout=60
+        self.llm = None
+        self.conversations: Dict[str, ConversationContext] = {}
+
+        if LANGCHAIN_AVAILABLE:
+            self.llm = OllamaLLM(
+                model=model_name,
+                base_url=base_url,
+                temperature=0.2,  # Lower for more consistent output
+                num_predict=1500,  # Reduced token limit
+            )
+            logger.info(f"TaskAgent initialized: {model_name}")
+        else:
+            logger.warning("LangChain unavailable - using fallback")
+
+    def chat(
+        self,
+        user_input: str,
+        session_id: Optional[str] = None,
+        user_tasks: Optional[List[Dict]] = None
+    ) -> AgentResponse:
+        """
+        Main chat method - handles all user interactions.
+
+        Args:
+            user_input: User's message
+            session_id: Session ID for conversation tracking
+            user_tasks: Current user's tasks for context
+
+        Returns:
+            AgentResponse with actions, suggestions, or clarification request
+        """
+        # Get or create conversation context
+        if not session_id:
+            session_id = str(uuid.uuid4())
+
+        context = self._get_or_create_context(session_id)
+
+        # Add user message to history
+        context.messages.append(ConversationMessage(role="user", content=user_input))
+
+        # Check if this is a response to clarification
+        if context.awaiting_clarification:
+            return self._handle_clarification_response(context, user_input, user_tasks)
+
+        # Check if accepting/rejecting suggestions
+        if context.pending_suggestions:
+            suggestion_response = self._check_suggestion_response(context, user_input)
+            if suggestion_response:
+                return suggestion_response
+
+        # Process with LLM
+        try:
+            response = self._process_with_llm(context, user_input, user_tasks)
+        except Exception as e:
+            logger.error(f"LLM error: {e}")
+            response = self._fallback_processing(user_input)
+
+        # Add assistant response to history
+        context.messages.append(ConversationMessage(role="assistant", content=response.message))
+
+        # Update context state based on response type
+        if response.type == ResponseType.CLARIFY:
+            context.awaiting_clarification = True
+            context.clarification_topic = user_input
+        elif response.type == ResponseType.SUGGEST:
+            context.pending_suggestions = response.suggestions
+
+        response.context_key = session_id
+        return response
+
+    def _get_or_create_context(self, session_id: str) -> ConversationContext:
+        """Get existing or create new conversation context"""
+        if session_id not in self.conversations:
+            self.conversations[session_id] = ConversationContext(session_id=session_id)
+        return self.conversations[session_id]
+
+    def _build_tasks_context(self, user_tasks: Optional[List[Dict]]) -> str:
+        """Build compact task context string"""
+        if not user_tasks:
+            return "none"
+
+        # Only include essential info, limit to 10 tasks
+        tasks_str = []
+        for t in user_tasks[:10]:
+            name = t.get('name', t.get('title', ''))[:30]
+            due = t.get('due_date', '')[:10] if t.get('due_date') else ''
+            tid = str(t.get('id', ''))[:8]
+            tasks_str.append(f"{tid}:{name}:{due}")
+
+        return "|".join(tasks_str) if tasks_str else "none"
+
+    def _build_history_context(self, context: ConversationContext) -> str:
+        """Build compact conversation history"""
+        if len(context.messages) <= 1:
+            return ""
+
+        # Only last 4 messages for context
+        recent = context.messages[-5:-1]  # Exclude current message
+        history = []
+        for msg in recent:
+            role = "U" if msg.role == "user" else "A"
+            content = msg.content[:100]  # Truncate long messages
+            history.append(f"{role}:{content}")
+
+        return "\nHISTORY:" + "|".join(history) if history else ""
+
+    def _process_with_llm(
+        self,
+        context: ConversationContext,
+        user_input: str,
+        user_tasks: Optional[List[Dict]]
+    ) -> AgentResponse:
+        """Process input through LLM"""
+        if not self.llm:
+            return self._fallback_processing(user_input)
+
+        today = datetime.now().strftime("%Y-%m-%d(%a)")
+        tasks_ctx = self._build_tasks_context(user_tasks)
+        history_ctx = self._build_history_context(context)
+
+        prompt = self.SYSTEM_PROMPT.format(
+            today=today,
+            tasks_context=tasks_ctx,
+            input=user_input + history_ctx
         )
-        
-        self.chain = self._create_processing_chain()
-        logger.info(f"TaskAgent initialized with model: {model_name}")
-        
-    def _create_processing_chain(self) -> LLMChain:
-        """Create the LangChain processing chain with structured prompts"""
-        
-        template = """You are an intelligent task planning assistant. Analyze the user's intentions and extract specific, actionable tasks. Return ONLY valid JSON.
 
-User Input: {user_input}
+        # Call LLM
+        raw_response = self.llm.invoke(prompt)
 
-CLASSIFICATION RULES:
+        # Parse response
+        return self._parse_llm_response(raw_response, user_input)
 
-Categories:
-- work: Job-related, career development, professional tasks
-- education: Learning, studying, courses, skill development  
-- health: Exercise, medical, wellness, mental health
-- personal: Home, family, self-care, hobbies
-- social: Friends, relationships, networking, community
-- finance: Money management, investments, budgeting
+    def _parse_llm_response(self, raw: str, original_input: str) -> AgentResponse:
+        """Parse LLM JSON response into AgentResponse"""
+        import re
 
-Priority Scale (1-5):
-- 1: Low (nice to have, flexible timing)
-- 2: Normal (regular importance)
-- 3: Medium (important, should be done)
-- 4: High (urgent, deadline-sensitive)
-- 5: Critical (emergency, must be done immediately)
+        try:
+            # Clean response
+            raw = raw.strip()
+            raw = re.sub(r'//.*?(?=\n|$)', '', raw)
+            raw = re.sub(r',\s*([}\]])', r'\1', raw)
 
-Frequency Types:
-- daily: Every day activities
-- weekly: 1-6 times per week
-- monthly: Monthly or less frequent
-- once: One-time task or project
+            # Find JSON
+            start = raw.find('{')
+            end = raw.rfind('}') + 1
 
-Time Preferences:
-- morning: 6AM-12PM (best for high-energy, focus tasks)
-- afternoon: 12PM-5PM (meetings, administrative work)
-- evening: 5PM-10PM (exercise, social, relaxing activities)
-- anytime: Flexible timing
+            if start >= 0 and end > start:
+                json_str = raw[start:end]
+                data = json.loads(json_str)
 
-Energy Levels:
-- high: Requires deep focus, creativity, physical energy
-- medium: Normal concentration, moderate effort
-- low: Light tasks, can be done when tired
+                # Parse response type
+                resp_type = ResponseType(data.get('type', 'actions'))
 
-Deadline Urgency:
-- urgent: Has specific deadline or time-sensitive
-- normal: Regular timeline, some flexibility
-- flexible: No rush, can be rescheduled
+                # Parse actions
+                actions = []
+                for act in data.get('actions', []):
+                    try:
+                        actions.append(TaskAction(**act))
+                    except Exception as e:
+                        logger.warning(f"Invalid action: {e}")
 
-EXAMPLES:
-Input: "learn Chinese daily, work on thesis, go to gym"
-Expected tasks:
-1. "Study Chinese language" (education, priority 3, daily, 30 mins, morning, medium, normal)
-2. "Work on graduation thesis" (education, priority 5, daily, 120 mins, morning, high, urgent)
-3. "Go to gym workout" (health, priority 3, weekly, 60 mins, evening, high, normal)
+                # Parse suggestions
+                suggestions = []
+                for sug in data.get('suggestions', []):
+                    try:
+                        suggestions.append(TaskSuggestion(**sug))
+                    except Exception as e:
+                        logger.warning(f"Invalid suggestion: {e}")
 
-Calculate total weekly time and feasibility score (0-10).
+                return AgentResponse(
+                    type=resp_type,
+                    message=data.get('message', 'Done.'),
+                    actions=actions,
+                    suggestions=suggestions,
+                    clarify_options=data.get('clarify_options', [])
+                )
 
-Required JSON format:
-{{
-    "tasks": [
-        {{
-            "title": "Study Chinese language",
-            "category": "education",
-            "priority": 3,
-            "frequency": "daily",
-            "duration": 30,
-            "time_preference": "morning",
-            "energy_level": "medium",
-            "deadline_urgency": "normal"
-        }}
-    ],
-    "insights": [
-        "Balanced schedule with good variety",
-        "High-energy tasks scheduled for morning"
-    ],
-    "total_estimated_time": 420,
-    "feasibility_score": 8.5
-}}
+            raise ValueError("No JSON found")
 
-Analyze this input: {user_input}
+        except Exception as e:
+            logger.error(f"Parse error: {e}, raw: {raw[:200]}")
+            return self._fallback_processing(original_input)
 
-JSON Response:"""
-        
-        prompt = PromptTemplate(
-            template=template,
-            input_variables=["user_input"]
+    def _handle_clarification_response(
+        self,
+        context: ConversationContext,
+        user_input: str,
+        user_tasks: Optional[List[Dict]]
+    ) -> AgentResponse:
+        """Handle user's response to a clarification question"""
+        context.awaiting_clarification = False
+        original_topic = context.clarification_topic or ""
+        context.clarification_topic = None
+
+        # Combine original topic with clarification
+        combined_input = f"{original_topic}. User chose: {user_input}"
+
+        return self._process_with_llm(context, combined_input, user_tasks)
+
+    def _check_suggestion_response(
+        self,
+        context: ConversationContext,
+        user_input: str
+    ) -> Optional[AgentResponse]:
+        """Check if user is responding to suggestions"""
+        input_lower = user_input.lower().strip()
+
+        # Accept all suggestions
+        if input_lower in ['yes', 'ok', 'accept', 'accept all', 'yes all', 'confirm']:
+            actions = []
+            for sug in context.pending_suggestions:
+                actions.append(TaskAction(
+                    action=ActionType.INSERT,
+                    title=sug.title,
+                    description=sug.description,
+                    category=sug.category,
+                    priority=sug.priority,
+                    due_date=sug.due_date,
+                    duration=sug.duration,
+                    frequency=sug.frequency
+                ))
+
+            count = len(actions)
+            context.pending_suggestions = []
+
+            return AgentResponse(
+                type=ResponseType.ACTIONS,
+                message=f"Added {count} tasks to your schedule.",
+                actions=actions
+            )
+
+        # Reject all
+        if input_lower in ['no', 'cancel', 'reject', 'nevermind', 'no thanks']:
+            context.pending_suggestions = []
+            return AgentResponse(
+                type=ResponseType.CHAT,
+                message="No problem, suggestions discarded. What else can I help with?"
+            )
+
+        # Accept specific by number
+        if input_lower.startswith('accept ') or input_lower.replace(',', ' ').replace(' ', '').isdigit():
+            # Parse numbers like "1,2,3" or "accept 1 2 3"
+            nums = re.findall(r'\d+', input_lower)
+            indices = [int(n) - 1 for n in nums]  # Convert to 0-indexed
+
+            actions = []
+            accepted_titles = []
+
+            for i in indices:
+                if 0 <= i < len(context.pending_suggestions):
+                    sug = context.pending_suggestions[i]
+                    actions.append(TaskAction(
+                        action=ActionType.INSERT,
+                        title=sug.title,
+                        description=sug.description,
+                        category=sug.category,
+                        priority=sug.priority,
+                        due_date=sug.due_date,
+                        duration=sug.duration,
+                        frequency=sug.frequency
+                    ))
+                    accepted_titles.append(sug.title)
+
+            context.pending_suggestions = []
+
+            if actions:
+                return AgentResponse(
+                    type=ResponseType.ACTIONS,
+                    message=f"Added: {', '.join(accepted_titles)}",
+                    actions=actions
+                )
+
+        # Not a suggestion response, continue normal processing
+        return None
+
+    def _fallback_processing(self, user_input: str) -> AgentResponse:
+        """Rule-based fallback when LLM unavailable"""
+        input_lower = user_input.lower()
+        actions = []
+        suggestions = []
+
+        # Detect read queries
+        if any(w in input_lower for w in ['how many', 'count', 'list', 'show', 'what tasks']):
+            query_filter = "today" if "today" in input_lower else "all"
+            if "overdue" in input_lower:
+                query_filter = "overdue"
+
+            actions.append(TaskAction(
+                action=ActionType.READ,
+                query_type="count" if "how many" in input_lower else "list",
+                query_filter=query_filter
+            ))
+            return AgentResponse(
+                type=ResponseType.ACTIONS,
+                message="Fetching your tasks...",
+                actions=actions
+            )
+
+        # Detect insert
+        if any(w in input_lower for w in ['add', 'create', 'schedule', 'new task', 'remind']):
+            # Extract task titles (simple approach)
+            tasks_to_add = self._extract_tasks_simple(user_input)
+            for title in tasks_to_add:
+                actions.append(TaskAction(
+                    action=ActionType.INSERT,
+                    title=title,
+                    category=self._guess_category(title),
+                    priority=3
+                ))
+
+            if actions:
+                return AgentResponse(
+                    type=ResponseType.ACTIONS,
+                    message=f"Adding {len(actions)} task(s).",
+                    actions=actions
+                )
+
+        # Detect update
+        if any(w in input_lower for w in ['update', 'change', 'move', 'reschedule', 'postpone']):
+            actions.append(TaskAction(
+                action=ActionType.UPDATE,
+                title=user_input  # Will need to be parsed further
+            ))
+            return AgentResponse(
+                type=ResponseType.ACTIONS,
+                message="Updating task...",
+                actions=actions
+            )
+
+        # Detect complete
+        if any(w in input_lower for w in ['done', 'complete', 'finish', 'mark as done']):
+            actions.append(TaskAction(
+                action=ActionType.COMPLETE,
+                title=user_input
+            ))
+            return AgentResponse(
+                type=ResponseType.ACTIONS,
+                message="Marking task as complete...",
+                actions=actions
+            )
+
+        # Detect delete
+        if any(w in input_lower for w in ['delete', 'remove', 'cancel task']):
+            actions.append(TaskAction(
+                action=ActionType.DELETE,
+                title=user_input
+            ))
+            return AgentResponse(
+                type=ResponseType.ACTIONS,
+                message="Deleting task...",
+                actions=actions
+            )
+
+        # Detect planning/ambiguous
+        if any(w in input_lower for w in ['plan', 'help me', 'i want to', 'healthier', 'productive', 'better']):
+            return AgentResponse(
+                type=ResponseType.CLARIFY,
+                message="I'd like to help! Could you be more specific about what you want to achieve?",
+                clarify_options=[
+                    "Create a workout routine",
+                    "Plan my work schedule",
+                    "Organize my daily tasks",
+                    "Something else"
+                ]
+            )
+
+        # Default: unclear input
+        return AgentResponse(
+            type=ResponseType.CHAT,
+            message="I can help you manage tasks. Try: 'add task', 'show my tasks', 'mark X as done', or tell me what you're planning.",
         )
-        
-        return LLMChain(llm=self.llm, prompt=prompt, verbose=True)
-    
+
+    def _extract_tasks_simple(self, text: str) -> List[str]:
+        """Simple task extraction from text"""
+        # Remove common prefixes
+        text = re.sub(r'^(add|create|schedule|remind me to)\s+', '', text, flags=re.IGNORECASE)
+
+        # Split by common delimiters
+        if ' and ' in text.lower():
+            parts = re.split(r'\s+and\s+', text, flags=re.IGNORECASE)
+        elif ',' in text:
+            parts = text.split(',')
+        else:
+            parts = [text]
+
+        return [p.strip() for p in parts if p.strip()]
+
+    def _guess_category(self, title: str) -> str:
+        """Guess category from task title"""
+        title_lower = title.lower()
+        if any(w in title_lower for w in ['gym', 'exercise', 'workout', 'run', 'yoga']):
+            return "health"
+        if any(w in title_lower for w in ['study', 'homework', 'learn', 'class', 'exam']):
+            return "education"
+        if any(w in title_lower for w in ['meeting', 'report', 'email', 'call', 'presentation']):
+            return "work"
+        if any(w in title_lower for w in ['clean', 'groceries', 'laundry', 'cook']):
+            return "personal"
+        return "personal"
+
+    # =========================================================================
+    # Suggestion Management
+    # =========================================================================
+
+    def get_pending_suggestions(self, session_id: str) -> List[TaskSuggestion]:
+        """Get pending suggestions for a session"""
+        context = self.conversations.get(session_id)
+        return context.pending_suggestions if context else []
+
+    def accept_suggestion(self, session_id: str, suggestion_id: str) -> Optional[TaskAction]:
+        """Accept a specific suggestion by ID"""
+        context = self.conversations.get(session_id)
+        if not context:
+            return None
+
+        for i, sug in enumerate(context.pending_suggestions):
+            if sug.id == suggestion_id:
+                action = TaskAction(
+                    action=ActionType.INSERT,
+                    title=sug.title,
+                    description=sug.description,
+                    category=sug.category,
+                    priority=sug.priority,
+                    due_date=sug.due_date,
+                    duration=sug.duration,
+                    frequency=sug.frequency
+                )
+                context.pending_suggestions.pop(i)
+                return action
+
+        return None
+
+    def modify_suggestion(
+        self,
+        session_id: str,
+        suggestion_id: str,
+        modifications: Dict
+    ) -> Optional[TaskSuggestion]:
+        """Modify a pending suggestion"""
+        context = self.conversations.get(session_id)
+        if not context:
+            return None
+
+        for sug in context.pending_suggestions:
+            if sug.id == suggestion_id:
+                for key, value in modifications.items():
+                    if hasattr(sug, key):
+                        setattr(sug, key, value)
+                return sug
+
+        return None
+
+    def clear_suggestions(self, session_id: str) -> None:
+        """Clear all pending suggestions for a session"""
+        context = self.conversations.get(session_id)
+        if context:
+            context.pending_suggestions = []
+
+    # =========================================================================
+    # Session Management
+    # =========================================================================
+
+    def clear_session(self, session_id: str) -> None:
+        """Clear a conversation session"""
+        if session_id in self.conversations:
+            del self.conversations[session_id]
+
+    def get_session_history(self, session_id: str) -> List[ConversationMessage]:
+        """Get conversation history for a session"""
+        context = self.conversations.get(session_id)
+        return context.messages if context else []
+
+    # =========================================================================
+    # Legacy Support
+    # =========================================================================
+
     def process_intentions(self, user_input: str, context: Optional[Dict] = None) -> TaskExtractionOutput:
         """
-        Main method to process user intentions and return structured tasks
-        
-        Args:
-            user_input: Natural language description of user's intentions
-            context: Optional context about user preferences, existing tasks, etc.
-            
-        Returns:
-            TaskExtractionOutput with structured tasks and insights
+        Legacy method for backward compatibility.
+        Converts new response format to old TaskExtractionOutput.
         """
-        
-        logger.info(f"Processing intentions with Ollama: {user_input[:100]}...")
-        
-        try:
-            # Add context to input if provided
-            enhanced_input = self._enhance_input_with_context(user_input, context)
-            
-            # Process through Ollama
-            result = self.chain.run(user_input=enhanced_input)
-            
-            # Parse JSON response
-            parsed_data = self._parse_llm_response(result)
-            
-            # Convert to Pydantic model
-            output = TaskExtractionOutput(**parsed_data)
-            
-            # Validate and enhance the result
-            validated_result = self._validate_and_enhance_output(output)
-            
-            logger.info(f"Successfully processed {len(validated_result.tasks)} tasks")
-            return validated_result
-            
-        except Exception as e:
-            logger.error(f"Error in Ollama processing: {str(e)}")
-            # Fallback to rule-based processing
-            return self._fallback_processing(user_input)
-    
-    def _enhance_input_with_context(self, user_input: str, context: Optional[Dict]) -> str:
-        """Enhance user input with additional context if available"""
-        
-        if not context:
-            return user_input
-            
-        enhanced = user_input
-        
-        # Add context about user preferences
-        if context.get('work_hours'):
-            enhanced += f"\nUser typically works: {context['work_hours']}"
-            
-        if context.get('energy_peaks'):
-            enhanced += f"\nUser has peak energy during: {context['energy_peaks']}"
-            
-        if context.get('existing_commitments'):
-            enhanced += f"\nExisting time commitments: {context['existing_commitments']} hours/week"
-            
-        return enhanced
-    
-    def _parse_llm_response(self, response: str) -> dict:
-        """Parse LLM response and extract JSON"""
-        try:
-            # Clean the response
-            response = response.strip()
-            
-            # Find JSON in response (look for first { to last })
-            start = response.find('{')
-            end = response.rfind('}') + 1
-            
-            if start >= 0 and end > start:
-                json_str = response[start:end]
-                
-                # Try to parse JSON
-                parsed = json.loads(json_str)
-                
-                # Validate required fields
-                if 'tasks' not in parsed:
-                    raise ValueError("Missing 'tasks' field in response")
-                
-                return parsed
-            else:
-                raise ValueError("No valid JSON found in response")
-                
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing error: {e}")
-            logger.error(f"Raw response: {response}")
-            raise ValueError("Invalid JSON in LLM response")
-    
-    def _validate_and_enhance_output(self, output: TaskExtractionOutput) -> TaskExtractionOutput:
-        """Validate and enhance the AI output with additional logic"""
-        
-        # Calculate total weekly time commitment
-        total_weekly_minutes = 0
-        for task in output.tasks:
-            if task.frequency == 'daily':
-                total_weekly_minutes += task.duration * 7
-            elif task.frequency == 'weekly':
-                total_weekly_minutes += task.duration * 3  # Assume 3x per week average
-            elif task.frequency == 'monthly':
-                total_weekly_minutes += task.duration * 0.25  # Monthly divided by 4
-            else:  # once
-                total_weekly_minutes += task.duration * 0.1  # Spread over 10 weeks
-        
-        output.total_estimated_time = int(total_weekly_minutes)
-        
-        # Calculate feasibility score if not provided
-        if output.feasibility_score == 0:
-            feasibility_score = self._calculate_feasibility_score(total_weekly_minutes, output.tasks)
-            output.feasibility_score = feasibility_score
-        
-        # Add enhanced insights
-        enhanced_insights = self._generate_enhanced_insights(output.tasks, total_weekly_minutes)
-        output.insights.extend(enhanced_insights)
-        
-        return output
-    
-    def _calculate_feasibility_score(self, total_minutes: int, tasks: List[TaskItem]) -> float:
-        """Calculate how feasible the schedule is (0-10 scale)"""
-        
-        # Base score starts at 10
-        score = 10.0
-        
-        # Time commitment penalty
-        total_hours = total_minutes / 60
-        if total_hours > 40:
-            score -= 3.0  # Too much time commitment
-        elif total_hours > 25:
-            score -= 1.5  # High but manageable
-        
-        # High priority task overload
-        high_priority_count = len([t for t in tasks if t.priority >= 4])
-        if high_priority_count > 3:
-            score -= 2.0
-            
-        # Energy level balance
-        high_energy_count = len([t for t in tasks if t.energy_level == 'high'])
-        if high_energy_count > 2:
-            score -= 1.0
-            
-        # Ensure minimum score
-        return max(score, 1.0)
-    
-    def _generate_enhanced_insights(self, tasks: List[TaskItem], total_minutes: int) -> List[str]:
-        """Generate additional insights based on task analysis"""
-        
-        insights = []
-        
-        # Time commitment insight
-        hours_per_week = total_minutes / 60
-        if hours_per_week > 35:
-            insights.append(f"⚠️ High time commitment: {hours_per_week:.1f} hours/week. Consider prioritizing tasks.")
-        elif hours_per_week < 10:
-            insights.append(f"✅ Manageable schedule: {hours_per_week:.1f} hours/week. Room for additional activities.")
-        else:
-            insights.append(f"✅ Balanced schedule: {hours_per_week:.1f} hours/week.")
-        
-        # Category distribution
-        categories = [task.category for task in tasks]
-        category_counts = {cat: categories.count(cat) for cat in set(categories)}
-        
-        if category_counts.get('work', 0) > 3:
-            insights.append("💼 Work-heavy schedule. Consider adding personal/health activities for balance.")
-        
-        if 'health' not in categories:
-            insights.append("🏃‍♂️ Consider adding health/fitness activities to your routine.")
-            
-        if 'social' not in categories:
-            insights.append("👥 Consider scheduling social activities for work-life balance.")
-        
-        # Priority distribution
-        urgent_tasks = [t for t in tasks if t.priority >= 4]
-        if len(urgent_tasks) > 3:
-            insights.append("🔥 Multiple high-priority tasks. Focus on 1-2 critical items first.")
-        
-        # Energy level recommendations
-        high_energy_tasks = [t for t in tasks if t.energy_level == 'high']
-        if len(high_energy_tasks) > 0:
-            insights.append("⚡ Schedule high-energy tasks during your peak hours for better productivity.")
-        
-        return insights
-    
-    def _fallback_processing(self, user_input: str) -> TaskExtractionOutput:
-        """
-        Simple rule-based fallback when Ollama fails
-        Provides basic task extraction using keyword matching
-        """
-        
-        logger.warning("Using fallback processing due to Ollama failure")
-        
+        user_tasks = context.get('user_tasks') if context else None
+        response = self.chat(user_input, user_tasks=user_tasks)
+
         tasks = []
-        insights = ["⚠️ Using simplified processing. Results may be less accurate."]
-        
-        # Basic keyword matching
-        input_lower = user_input.lower()
-        
-        # Education keywords
-        if any(word in input_lower for word in ['learn', 'study', 'course', 'language', 'chinese', 'english', 'thesis', 'research']):
+        for action in response.actions:
+            if action.action == ActionType.INSERT:
+                tasks.append(TaskItem(
+                    title=action.title or "Task",
+                    category=action.category or "personal",
+                    priority=action.priority or 3,
+                    frequency=action.frequency or "once",
+                    duration=action.duration or 30,
+                    due_date=action.due_date,
+                    due_time=action.due_time
+                ))
+
+        for sug in response.suggestions:
             tasks.append(TaskItem(
-                title="Study/Learning Activity",
-                category="education",
-                priority=3,
-                frequency="daily",
-                duration=60,
-                time_preference="morning",
-                energy_level="medium",
-                deadline_urgency="normal"
+                title=sug.title,
+                category=sug.category,
+                priority=sug.priority,
+                frequency=sug.frequency,
+                duration=sug.duration,
+                due_date=sug.due_date
             ))
-        
-        # Health keywords
-        if any(word in input_lower for word in ['gym', 'exercise', 'workout', 'fitness', 'health', 'sport']):
-            tasks.append(TaskItem(
-                title="Exercise/Fitness Activity", 
-                category="health",
-                priority=3,
-                frequency="weekly",
-                duration=60,
-                time_preference="evening",
-                energy_level="high",
-                deadline_urgency="normal"
-            ))
-        
-        # Work keywords
-        if any(word in input_lower for word in ['cv', 'resume', 'interview', 'job', 'work', 'career', 'project']):
-            tasks.append(TaskItem(
-                title="Career Development Task",
-                category="work", 
-                priority=4,
-                frequency="weekly",
-                duration=90,
-                time_preference="afternoon",
-                energy_level="medium",
-                deadline_urgency="urgent"
-            ))
-        
-        # Default task if nothing matched
-        if not tasks:
-            tasks.append(TaskItem(
-                title="General Task",
-                category="personal",
-                priority=2,
-                frequency="once", 
-                duration=30,
-                time_preference="anytime",
-                energy_level="low",
-                deadline_urgency="flexible"
-            ))
-        
+
         return TaskExtractionOutput(
             tasks=tasks,
-            insights=insights,
-            total_estimated_time=sum(task.duration for task in tasks),
-            feasibility_score=7.0
+            insights=[response.message],
+            total_estimated_time=sum(t.duration for t in tasks),
+            feasibility_score=8.0
         )
-    
+
     def validate_ollama_connection(self) -> bool:
-        """Validate if Ollama is running and model is available"""
+        """Check if Ollama is running"""
         try:
-            # Check if Ollama is running
             response = requests.get(f"{self.base_url}/api/tags", timeout=5)
             if response.status_code != 200:
-                logger.error("Ollama server is not responding")
                 return False
-            
-            # Check if our model is available
+
             models = response.json().get('models', [])
-            model_names = [model['name'] for model in models]
-            
-            model_available = any(self.model_name in name for name in model_names)
-            if not model_available:
-                logger.error(f"Model {self.model_name} not found. Available: {model_names}")
-                
-            return model_available
-            
+            model_names = [m['name'] for m in models]
+            return any(self.model_name in name for name in model_names)
         except Exception as e:
-            logger.error(f"Ollama connection check failed: {e}")
+            logger.error(f"Ollama check failed: {e}")
             return False
-    
+
     def get_available_models(self) -> List[str]:
-        """Get list of available Ollama models"""
+        """Get available Ollama models"""
         try:
             response = requests.get(f"{self.base_url}/api/tags", timeout=5)
             if response.status_code == 200:
                 models = response.json().get('models', [])
-                return [model['name'] for model in models]
+                return [m['name'] for m in models]
             return []
-        except Exception as e:
-            logger.error(f"Failed to get available models: {e}")
+        except:
             return []
+
+
+# Import for re module used in methods
+import re

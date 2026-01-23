@@ -406,3 +406,53 @@ def _get_typical_priority(user_id: int) -> int:
 def _get_user_timezone(user_id: int) -> str:
     """Get user's timezone"""
     return 'UTC'  # Default, should get from user profile
+
+
+@shared_task
+def analyze_user_patterns(
+    user_id: int,
+    analysis_type: str = 'full',
+    focus_area: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Analyze user's task patterns for insights.
+
+    Args:
+        user_id: User identifier
+        analysis_type: Type of analysis (full, quick, specific)
+        focus_area: Optional focus area (time, category, productivity)
+
+    Returns:
+        Dict containing pattern analysis results
+    """
+    try:
+        logger.info(f"Analyzing patterns for user {user_id}, type: {analysis_type}")
+
+        # Get user's recent tasks
+        thirty_days_ago = timezone.now() - timedelta(days=30)
+        tasks = Task.objects.filter(
+            created_at__gte=thirty_days_ago
+        )
+
+        # Basic pattern analysis
+        patterns = {
+            'total_tasks': tasks.count(),
+            'completed_tasks': tasks.filter(completed=True).count(),
+            'analysis_type': analysis_type,
+            'focus_area': focus_area,
+            'patterns_found': [],
+            'recommendations': [
+                'Consider scheduling high-priority tasks in the morning',
+                'Break large tasks into smaller subtasks'
+            ]
+        }
+
+        # Store results
+        cache_key = f"user_patterns:{user_id}"
+        cache.set(cache_key, patterns, 3600)  # Cache for 1 hour
+
+        return patterns
+
+    except Exception as e:
+        logger.error(f"Failed to analyze patterns: {str(e)}")
+        return {'error': str(e), 'patterns_found': []}

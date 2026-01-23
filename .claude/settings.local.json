@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python manage.py:*)",
+      "Bash(pip install:*)",
+      "Bash(pip freeze:*)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(start:*)",
+      "Bash(del \"D:\\\\jarvis\\\\jarvis_v0_full_stacks\\\\back-end\\\\tasks_api\\\\models.py\")",
+      "Bash(cmd /c del \"D:\\\\jarvis\\\\jarvis_v0_full_stacks\\\\back-end\\\\tasks_api\\\\models.py\")",
+      "Bash(python -m pytest:*)",
+      "Bash(python:*)",
+      "Bash(ollama --version:*)",
+      "Bash(ollama list:*)",
+      "Bash(ollama pull:*)",
+      "Bash(curl:*)",
+      "Bash(timeout /t 5 /nobreak)"
+    ]
+  }
+}

@@ -39,13 +39,18 @@ class MongoDBManager:
     def __init__(self):
         if not hasattr(self, 'initialized'):
             self.initialized = True
-            self._connect()
+            self._connected = False
+            # Don't connect at init - use lazy connection
+            # self._connect()
     
-    def _connect(self) -> None:
-        """Establish MongoDB connection with retry logic"""
-        max_retries = 3
+    def _connect(self) -> bool:
+        """Establish MongoDB connection with retry logic. Returns True on success."""
+        if self._connected:
+            return True
+
+        max_retries = 2
         retry_delay = 1
-        
+
         for attempt in range(max_retries):
             try:
                 # Get MongoDB settings
@@ -57,7 +62,7 @@ class MongoDBManager:
                     'password': None,
                     'auth_source': 'admin'
                 })
-                
+
                 # Build connection URL
                 if mongo_settings.get('username'):
                     mongo_url = (
@@ -68,31 +73,32 @@ class MongoDBManager:
                     )
                 else:
                     mongo_url = f"mongodb://{mongo_settings['host']}:{mongo_settings['port']}/"
-                
+
                 # Create client with connection pooling
                 self._client = MongoClient(
                     mongo_url,
                     maxPoolSize=50,
                     minPoolSize=10,
                     maxIdleTimeMS=60000,
-                    connectTimeoutMS=5000,
-                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=2000,
+                    serverSelectionTimeoutMS=2000,
                     retryWrites=True
                 )
-                
+
                 # Test connection
                 self._client.server_info()
-                
+
                 # Get database
                 self._db = self._client[mongo_settings['db_name']]
-                
+
                 # Create indexes
                 self._create_indexes()
-                
+
                 logger.info("MongoDB connection established successfully")
-                break
-                
-            except ConnectionFailure as e:
+                self._connected = True
+                return True
+
+            except Exception as e:
                 if attempt < max_retries - 1:
                     logger.warning(
                         f"MongoDB connection attempt {attempt + 1} failed. "
@@ -101,10 +107,11 @@ class MongoDBManager:
                     time.sleep(retry_delay)
                     retry_delay *= 2
                 else:
-                    logger.error(f"Failed to connect to MongoDB: {str(e)}")
-                    raise MongoDBConnectionError(
-                        "Unable to establish MongoDB connection"
-                    )
+                    logger.warning(f"MongoDB not available: {str(e)}. AI features will use fallback.")
+                    self._connected = False
+                    return False
+
+        return False
     
     def _create_indexes(self) -> None:
         """Create necessary indexes for performance"""
@@ -140,22 +147,31 @@ class MongoDBManager:
             logger.error(f"Failed to create indexes: {str(e)}")
     
     @property
-    def db(self) -> Database:
+    def is_connected(self) -> bool:
+        """Check if MongoDB is connected"""
+        return self._connected
+
+    @property
+    def db(self) -> Optional[Database]:
         """Get database instance"""
-        if not self._db:
+        if not self._connected:
             self._connect()
         return self._db
-    
+
     @property
-    def client(self) -> MongoClient:
+    def client(self) -> Optional[MongoClient]:
         """Get MongoDB client"""
-        if not self._client:
+        if not self._connected:
             self._connect()
         return self._client
-    
-    def get_collection(self, name: str) -> Collection:
+
+    def get_collection(self, name: str) -> Optional[Collection]:
         """Get collection by name"""
-        return self.db[name]
+        if not self._connected:
+            self._connect()
+        if self._db:
+            return self._db[name]
+        return None
     
     @contextmanager
     def session(self):
@@ -253,7 +269,7 @@ def with_mongodb_retry(retries: int = 3, delay: float = 1.0):
 
 class InsightsRepository:
     """Repository for AI-generated insights operations"""
-    
+
     @staticmethod
     @with_mongodb_retry()
     def save_insight(
@@ -263,17 +279,20 @@ class InsightsRepository:
     ) -> str:
         """
         Save AI-generated insight.
-        
+
         Args:
             user_id: User identifier
             insight_data: Insight data to save
             session_id: Optional session ID
-            
+
         Returns:
-            Inserted document ID
+            Inserted document ID or empty string if MongoDB unavailable
         """
         collection = get_insights_collection()
-        
+        if collection is None:
+            logger.warning("MongoDB not available, cannot save insight")
+            return ""
+
         document = {
             'user_id': user_id,
             'session_id': session_id,
@@ -284,13 +303,13 @@ class InsightsRepository:
             'recommendations': insight_data.get('recommendations', []),
             'metadata': insight_data.get('metadata', {})
         }
-        
+
         result = collection.insert_one(document)
-        
+
         # Invalidate cache
         cache_key = f"user_insights:{user_id}"
         cache.delete(cache_key)
-        
+
         return str(result.inserted_id)
     
     @staticmethod
@@ -302,12 +321,12 @@ class InsightsRepository:
     ) -> List[Dict[str, Any]]:
         """
         Get user's insights with caching.
-        
+
         Args:
             user_id: User identifier
             limit: Maximum number of insights
             insight_type: Filter by type
-            
+
         Returns:
             List of insights
         """
@@ -316,27 +335,29 @@ class InsightsRepository:
         cached_insights = cache.get(cache_key)
         if cached_insights:
             return cached_insights
-        
+
         collection = get_insights_collection()
-        
+        if collection is None:
+            return []
+
         # Build query
         query = {'user_id': user_id}
         if insight_type:
             query['type'] = insight_type
-        
+
         # Fetch insights
         cursor = collection.find(query).sort(
             'created_at', DESCENDING
         ).limit(limit)
-        
+
         insights = []
         for doc in cursor:
             doc['_id'] = str(doc['_id'])
             insights.append(doc)
-        
+
         # Cache for 5 minutes
         cache.set(cache_key, insights, 300)
-        
+
         return insights
     
     @staticmethod
@@ -347,16 +368,18 @@ class InsightsRepository:
     ) -> Dict[str, Any]:
         """
         Get aggregated insights for analytics.
-        
+
         Args:
             user_id: User identifier
             days: Number of days to aggregate
-            
+
         Returns:
             Aggregated insights data
         """
         collection = get_insights_collection()
-        
+        if collection is None:
+            return {'user_id': user_id, 'period_days': days, 'insight_types': [], 'total_insights': 0, 'average_confidence': 0}
+
         start_date = datetime.utcnow() - timedelta(days=days)
         
         pipeline = [
@@ -420,17 +443,19 @@ class InsightsRepository:
     ) -> List[Dict[str, Any]]:
         """
         Search user's insights using text search.
-        
+
         Args:
             user_id: User identifier
             search_text: Text to search for
             limit: Maximum results
-            
+
         Returns:
             List of matching insights
         """
         collection = get_insights_collection()
-        
+        if collection is None:
+            return []
+
         results = collection.find(
             {
                 'user_id': user_id,
@@ -452,7 +477,7 @@ class InsightsRepository:
 
 class TaskPatternsRepository:
     """Repository for task pattern analysis"""
-    
+
     @staticmethod
     @with_mongodb_retry()
     def save_pattern(
@@ -463,7 +488,9 @@ class TaskPatternsRepository:
     ) -> str:
         """Save discovered task pattern"""
         collection = get_patterns_collection()
-        
+        if collection is None:
+            return ""
+
         document = {
             'user_id': user_id,
             'pattern_type': pattern_type,
@@ -485,7 +512,9 @@ class TaskPatternsRepository:
     ) -> List[Dict[str, Any]]:
         """Get user's discovered patterns"""
         collection = get_patterns_collection()
-        
+        if collection is None:
+            return []
+
         patterns = collection.find({
             'user_id': user_id,
             'confidence': {'$gte': min_confidence}
@@ -501,7 +530,9 @@ class TaskPatternsRepository:
     def update_pattern_usage(pattern_id: str) -> None:
         """Update pattern usage statistics"""
         collection = get_patterns_collection()
-        
+        if collection is None:
+            return
+
         collection.update_one(
             {'_id': ObjectId(pattern_id)},
             {
@@ -512,7 +543,7 @@ class TaskPatternsRepository:
 
 class AILogsRepository:
     """Repository for AI processing logs"""
-    
+
     @staticmethod
     @with_mongodb_retry()
     def log_ai_processing(
@@ -525,7 +556,9 @@ class AILogsRepository:
     ) -> str:
         """Log AI processing request and response"""
         collection = get_ai_logs_collection()
-        
+        if collection is None:
+            return ""
+
         document = {
             'user_id': user_id,
             'timestamp': datetime.utcnow(),
@@ -549,7 +582,16 @@ class AILogsRepository:
     ) -> Dict[str, Any]:
         """Get AI processing statistics"""
         collection = get_ai_logs_collection()
-        
+        if collection is None:
+            return {
+                'total_requests': 0,
+                'successful_requests': 0,
+                'avg_processing_time': 0,
+                'total_tokens': 0,
+                'success_rate': 0,
+                'errors': []
+            }
+
         start_date = datetime.utcnow() - timedelta(days=days)
         
         pipeline = [
@@ -605,40 +647,48 @@ class AILogsRepository:
 def cleanup_old_data(days_to_keep: int = 90) -> Dict[str, int]:
     """
     Clean up old data from MongoDB collections.
-    
+
     Args:
         days_to_keep: Number of days to keep data
-        
+
     Returns:
         Dictionary with deletion counts
     """
+    results = {'insights': 0, 'ai_logs': 0, 'patterns': 0}
+
+    insights_collection = get_insights_collection()
+    logs_collection = get_ai_logs_collection()
+    patterns_collection = get_patterns_collection()
+
+    if insights_collection is None or logs_collection is None or patterns_collection is None:
+        logger.warning("MongoDB not available, cannot clean up data")
+        return results
+
     cutoff_date = datetime.utcnow() - timedelta(days=days_to_keep)
-    
-    results = {}
-    
+
     try:
         # Clean insights
-        insights_result = get_insights_collection().delete_many({
+        insights_result = insights_collection.delete_many({
             'created_at': {'$lt': cutoff_date}
         })
         results['insights'] = insights_result.deleted_count
-        
+
         # Clean AI logs
-        logs_result = get_ai_logs_collection().delete_many({
+        logs_result = logs_collection.delete_many({
             'timestamp': {'$lt': cutoff_date}
         })
         results['ai_logs'] = logs_result.deleted_count
-        
+
         # Clean old patterns
-        patterns_result = get_patterns_collection().delete_many({
+        patterns_result = patterns_collection.delete_many({
             'last_used': {'$lt': cutoff_date},
             'usage_count': {'$lt': 5}
         })
         results['patterns'] = patterns_result.deleted_count
-        
+
         logger.info(f"Cleaned up old MongoDB data: {results}")
-        
+
     except Exception as e:
         logger.error(f"Failed to clean up MongoDB data: {str(e)}")
-        
+
     return results

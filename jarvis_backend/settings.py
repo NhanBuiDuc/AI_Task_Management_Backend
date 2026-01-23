@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'drf_spectacular',
     'corsheaders',
     'django_celery_beat',
     'channels',
@@ -134,9 +135,33 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
+        'rest_framework.renderers.BrowsableAPIRenderer',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 50
+    'PAGE_SIZE': 50,
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+# DRF Spectacular (Swagger/OpenAPI) settings
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'JARVIS Task Management API',
+    'DESCRIPTION': 'API for managing tasks, projects, and sections in the JARVIS productivity app',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SCHEMA_PATH_PREFIX': r'/api/',
+    'SWAGGER_UI_SETTINGS': {
+        'deepLinking': True,
+        'persistAuthorization': True,
+        'displayOperationId': True,
+        'filter': True,
+    },
+    'TAGS': [
+        {'name': 'Tasks', 'description': 'Task CRUD operations'},
+        {'name': 'Projects', 'description': 'Project management'},
+        {'name': 'Sections', 'description': 'Section management'},
+        {'name': 'Views', 'description': 'Task view filters (inbox, today, upcoming, etc.)'},
+    ],
 }
 
 # CORS settings
