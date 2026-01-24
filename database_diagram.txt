@@ -1,0 +1,173 @@
+============================================================
+DATABASE SCHEMA DIAGRAM
+============================================================
+
+========================================
+  Account
+========================================
+  * id: UUIDField [PK]
+    created_at: DateTimeField
+    updated_at: DateTimeField
+    username: CharField
+    email: EmailField
+    password_hash: CharField
+    salt: CharField
+    display_name: CharField
+    avatar_url: URLField
+    is_active: BooleanField
+    last_login: DateTimeField
+    timezone: CharField
+    theme: CharField
+
+========================================
+  Project
+========================================
+  * id: UUIDField [PK]
+    created_at: DateTimeField
+    updated_at: DateTimeField
+  -> user: ForeignKey [FK -> Account]
+    name: CharField
+  -> parent: ForeignKey [FK -> Project]
+    icon: CharField
+    color: CharField
+    access_id: CharField
+    is_collaborative: BooleanField
+
+========================================
+  Section
+========================================
+  * id: UUIDField [PK]
+    created_at: DateTimeField
+    updated_at: DateTimeField
+  -> user: ForeignKey [FK -> Account]
+    name: CharField
+  -> project: ForeignKey [FK -> Project]
+
+========================================
+  Task
+========================================
+  * id: UUIDField [PK]
+    created_at: DateTimeField
+    updated_at: DateTimeField
+  -> user: ForeignKey [FK -> Account]
+    name: CharField
+    description: TextField
+  -> project: ForeignKey [FK -> Project]
+  -> section: ForeignKey [FK -> Section]
+    due_date: DateField
+    completed: BooleanField
+    totally_completed: BooleanField
+    priority: CharField
+    reminder_date: DateTimeField
+    completed_date: DateTimeField
+    duration_in_minutes: PositiveIntegerField
+    repeat: CharField
+  <> assigned_to: ManyToManyField [M2M -> Account]
+
+========================================
+  TaskView
+========================================
+  * id: BigAutoField [PK]
+  -> task: ForeignKey [FK -> Task]
+    view: CharField
+
+========================================
+  SectionView
+========================================
+  * id: BigAutoField [PK]
+  -> section: ForeignKey [FK -> Section]
+    view: CharField
+
+========================================
+  UserAchievement
+========================================
+  * id: UUIDField [PK]
+    created_at: DateTimeField
+    updated_at: DateTimeField
+    user_id: IntegerField
+    achievement_id: CharField
+    name: CharField
+    description: TextField
+    earned_at: DateTimeField
+
+========================================
+  TaskCollaboration
+========================================
+  * id: UUIDField [PK]
+    created_at: DateTimeField
+    updated_at: DateTimeField
+  -> task: ForeignKey [FK -> Task]
+  -> owner: ForeignKey [FK -> Account]
+  -> collaborator: ForeignKey [FK -> Account]
+    permission: CharField
+    is_active: BooleanField
+    accepted_at: DateTimeField
+
+========================================
+  TaskInvitation
+========================================
+  * id: UUIDField [PK]
+    created_at: DateTimeField
+    updated_at: DateTimeField
+  -> task: ForeignKey [FK -> Task]
+  -> invited_by: ForeignKey [FK -> Account]
+  -> invitee: ForeignKey [FK -> Account]
+    invitee_email: EmailField
+    permission: CharField
+    status: CharField
+    message: TextField
+    expires_at: DateTimeField
+    responded_at: DateTimeField
+
+========================================
+  ProjectCollaboration
+========================================
+  * id: UUIDField [PK]
+    created_at: DateTimeField
+    updated_at: DateTimeField
+  -> project: ForeignKey [FK -> Project]
+  -> collaborator: ForeignKey [FK -> Account]
+    role: CharField
+    is_active: BooleanField
+    joined_at: DateTimeField
+
+========================================
+  ProjectInvitation
+========================================
+  * id: UUIDField [PK]
+    created_at: DateTimeField
+    updated_at: DateTimeField
+  -> project: ForeignKey [FK -> Project]
+  -> invited_by: ForeignKey [FK -> Account]
+  -> invitee: ForeignKey [FK -> Account]
+    invitee_email: EmailField
+    role: CharField
+    status: CharField
+    message: TextField
+    expires_at: DateTimeField
+    responded_at: DateTimeField
+
+============================================================
+RELATIONSHIPS
+============================================================
+  Project.user -> Account
+  Project.parent -> Project
+  Section.user -> Account
+  Section.project -> Project
+  Task.user -> Account
+  Task.project -> Project
+  Task.section -> Section
+  Task.assigned_to <-> Account
+  TaskView.task -> Task
+  SectionView.section -> Section
+  TaskCollaboration.task -> Task
+  TaskCollaboration.owner -> Account
+  TaskCollaboration.collaborator -> Account
+  TaskInvitation.task -> Task
+  TaskInvitation.invited_by -> Account
+  TaskInvitation.invitee -> Account
+  ProjectCollaboration.project -> Project
+  ProjectCollaboration.collaborator -> Account
+  ProjectInvitation.project -> Project
+  ProjectInvitation.invited_by -> Account
+  ProjectInvitation.invitee -> Account
